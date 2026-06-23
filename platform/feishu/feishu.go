@@ -130,6 +130,10 @@ type Platform struct {
 	respondToAtEveryoneAndHere bool
 	shareSessionInChannel      bool
 	threadIsolation            bool
+	// threadUnsupportedChats tracks chat IDs that returned code 230071
+	// ("chat does not support topic replies"). Entries are populated lazily at
+	// runtime; we fall back to plain reply for those chats.
+	threadUnsupportedChats sync.Map
 	// noReplyToTrigger: when true, send via Create instead of Im.Message.Reply (no quote to the user's message).
 	noReplyToTrigger bool
 	resolveMentions  bool
@@ -643,7 +647,12 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 
 	// Check allow_chat filter: skip card actions from chats this platform doesn't own.
 	if event.Event.Context != nil && event.Event.Context.OpenChatID != "" {
-		if !core.AllowList(p.allowChat, event.Event.Context.OpenChatID) {
+		chatID := event.Event.Context.OpenChatID
+		if !core.AllowList(p.allowChat, chatID) {
+			return nil, nil
+		}
+		// Yield wildcard claims to peers that named this chat specifically.
+		if isAllowChatWildcard(p.allowChat) && chatClaimedByConcretePeer(p, chatID) {
 			return nil, nil
 		}
 	}
@@ -1335,8 +1344,16 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 		return nil
 	}
 
-	if chatType == "group" && !core.AllowList(p.allowChat, chatID) {
-		slog.Debug(p.tag()+": message from unauthorized chat", "chat_id", chatID)
+	if !core.AllowList(p.allowChat, chatID) {
+		slog.Debug(p.tag()+": message from unauthorized chat", "chat_id", chatID, "chat_type", chatType)
+		return nil
+	}
+	// Shared-WS routing: when this platform uses a wildcard allow_chat but
+	// another peer in the same shared WS group has specifically claimed this
+	// chat, yield to the peer. Prevents the same message from being processed
+	// by multiple projects sharing one Feishu app.
+	if isAllowChatWildcard(p.allowChat) && chatClaimedByConcretePeer(p, chatID) {
+		slog.Debug(p.tag()+": yielding chat to peer with concrete allow_chat", "chat_id", chatID, "chat_type", chatType)
 		return nil
 	}
 	if chatType != "group" && p.groupOnly {
@@ -3341,7 +3358,49 @@ func (p *Platform) shouldReplyInThread(rc replyContext) bool {
 	if rc.messageID == "" {
 		return false
 	}
-	return p.threadIsolation && isThreadSessionKey(rc.sessionKey)
+	if !p.threadIsolation {
+		return false
+	}
+	if p.threadUnsupportedForChat(rc.chatID) {
+		return false
+	}
+	// Group chats: only thread when sessionKey is root-keyed (group's
+	// root-based session isolation convention in makeSessionKey). P2P chats:
+	// sessionKey stays user-keyed (to preserve session continuity across
+	// turns), but Feishu still accepts reply_in_thread on p2p and collapses
+	// bot output under the user's trigger message.
+	if isThreadSessionKey(rc.sessionKey) {
+		return true
+	}
+	return true
+}
+
+func (p *Platform) threadUnsupportedForChat(chatID string) bool {
+	if chatID == "" {
+		return false
+	}
+	_, ok := p.threadUnsupportedChats.Load(chatID)
+	return ok
+}
+
+func (p *Platform) markThreadUnsupported(chatID string) {
+	if chatID == "" {
+		return
+	}
+	if _, loaded := p.threadUnsupportedChats.LoadOrStore(chatID, struct{}{}); !loaded {
+		slog.Info(p.tag()+": disabling thread replies for chat (server rejected with code 230071)",
+			"chat_id", chatID)
+	}
+}
+
+// isThreadUnsupportedErr returns true if err looks like Feishu code 230071
+// ("chat does not support topic replies"). We match by code token to avoid
+// pinning to a specific wrapped message format.
+func isThreadUnsupportedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "code=230071")
 }
 
 // shouldUseThreadOrReplyAPI is true when we should call Im.Message.Reply (optionally with ReplyInThread).
@@ -3370,6 +3429,16 @@ func (p *Platform) buildReplyMessageReqBody(rc replyContext, msgType, content st
 }
 
 func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, content string) error {
+	err := p.replyMessageOnce(ctx, rc, msgType, content)
+	if err != nil && p.shouldReplyInThread(rc) && isThreadUnsupportedErr(err) {
+		p.markThreadUnsupported(rc.chatID)
+		// Retry once without reply_in_thread.
+		return p.replyMessageOnce(ctx, rc, msgType, content)
+	}
+	return err
+}
+
+func (p *Platform) replyMessageOnce(ctx context.Context, rc replyContext, msgType, content string) error {
 	req := larkim.NewReplyMessageReqBuilder().
 		MessageId(rc.messageID).
 		Body(p.buildReplyMessageReqBody(rc, msgType, content)).
@@ -4201,24 +4270,33 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 
 	var msgID string
 	if p.shouldUseThreadOrReplyAPI(rc) {
-		req := larkim.NewReplyMessageReqBuilder().
-			MessageId(rc.messageID).
-			Body(p.buildReplyMessageReqBody(rc, larkim.MsgTypeInteractive, sendContent)).
-			Build()
-		var resp *larkim.ReplyMessageResp
-		if err := p.withTransientRetry(ctx, "send preview", func() error {
-			return p.withFreshTenantAccessTokenRetry(ctx, "send preview", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
-				var err error
-				resp, err = client.Im.Message.Reply(ctx, req, options...)
-				if err != nil {
-					return fmt.Errorf("%s: send preview (reply): %w", p.tag(), err)
-				}
-				if !resp.Success() {
-					return fmt.Errorf("%s: send preview (reply) code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
-				}
-				return nil
+		replyOnce := func() (*larkim.ReplyMessageResp, error) {
+			req := larkim.NewReplyMessageReqBuilder().
+				MessageId(rc.messageID).
+				Body(p.buildReplyMessageReqBody(rc, larkim.MsgTypeInteractive, sendContent)).
+				Build()
+			var resp *larkim.ReplyMessageResp
+			err := p.withTransientRetry(ctx, "send preview", func() error {
+				return p.withFreshTenantAccessTokenRetry(ctx, "send preview", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
+					var err error
+					resp, err = client.Im.Message.Reply(ctx, req, options...)
+					if err != nil {
+						return fmt.Errorf("%s: send preview (reply): %w", p.tag(), err)
+					}
+					if !resp.Success() {
+						return fmt.Errorf("%s: send preview (reply) code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
+					}
+					return nil
+				})
 			})
-		}); err != nil {
+			return resp, err
+		}
+		resp, err := replyOnce()
+		if err != nil && p.shouldReplyInThread(rc) && isThreadUnsupportedErr(err) {
+			p.markThreadUnsupported(rc.chatID)
+			resp, err = replyOnce()
+		}
+		if err != nil {
 			return nil, err
 		}
 		if resp.Data != nil && resp.Data.MessageId != nil {
@@ -6251,10 +6329,9 @@ func buildRichCardJSONBytes(status core.CardStatus, steps []core.ToolStep, markd
 				continue
 			}
 			footerElements = append(footerElements, map[string]any{
-				"tag":        "markdown",
-				"content":    sanitizeCardMarkdownForCard(line),
-				"text_size":  "notation",
-
+				"tag":       "markdown",
+				"content":   sanitizeCardMarkdownForCard(line),
+				"text_size": "notation",
 			})
 		}
 	}

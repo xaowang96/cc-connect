@@ -828,6 +828,9 @@ func TestLark_GroupReplyAllWithThreadIsolationUsesRootSessionKeyWithoutMention(t
 }
 
 func TestBuildReplyMessageReqBody_SetsReplyInThreadFlag(t *testing.T) {
+	p2pDenylisted := &Platform{threadIsolation: true}
+	p2pDenylisted.markThreadUnsupported("oc_chat")
+
 	tests := []struct {
 		name          string
 		platform      *Platform
@@ -835,15 +838,31 @@ func TestBuildReplyMessageReqBody_SetsReplyInThreadFlag(t *testing.T) {
 		wantThreading bool
 	}{
 		{
-			name:          "thread isolation enabled",
+			name:          "group root-keyed session threads",
 			platform:      &Platform{threadIsolation: true},
-			replyCtx:      replyContext{messageID: "om_reply", sessionKey: "feishu:oc_chat:root:om_root"},
+			replyCtx:      replyContext{messageID: "om_reply", chatID: "oc_chat", sessionKey: "feishu:oc_chat:root:om_root"},
 			wantThreading: true,
 		},
 		{
-			name:          "thread isolation does not affect p2p session",
+			// P2P: Feishu accepts reply_in_thread on p2p chats and collapses
+			// subsequent bot output under the user's trigger message. sessionKey
+			// stays user-keyed (for cross-turn session continuity); thread
+			// toggling is driven solely by the threadIsolation flag.
+			name:          "p2p session threads when isolation enabled",
 			platform:      &Platform{threadIsolation: true},
-			replyCtx:      replyContext{messageID: "om_reply", sessionKey: "feishu:oc_chat:ou_user"},
+			replyCtx:      replyContext{messageID: "om_reply", chatID: "oc_chat", sessionKey: "feishu:oc_chat:ou_user"},
+			wantThreading: true,
+		},
+		{
+			name:          "p2p without isolation stays non-threaded",
+			platform:      &Platform{},
+			replyCtx:      replyContext{messageID: "om_reply", chatID: "oc_chat", sessionKey: "feishu:oc_chat:ou_user"},
+			wantThreading: false,
+		},
+		{
+			name:          "denylisted chat falls back to plain reply",
+			platform:      p2pDenylisted,
+			replyCtx:      replyContext{messageID: "om_reply", chatID: "oc_chat", sessionKey: "feishu:oc_chat:ou_user"},
 			wantThreading: false,
 		},
 		{
@@ -1679,7 +1698,14 @@ func TestAllowChat_FiltersGroupMessages(t *testing.T) {
 		{"non-matching chat_id blocked", "oc_abc", "oc_xyz", "group", false},
 		{"multiple chat_ids, match second", "oc_abc,oc_xyz", "oc_xyz", "group", true},
 		{"multiple chat_ids, no match", "oc_abc,oc_def", "oc_xyz", "group", false},
-		{"private chat bypasses allow_chat filter", "oc_abc", "oc_xyz", "p2p", true},
+		// Previously p2p was exempt from allow_chat. That allowed the same
+		// message to be processed by every project sharing an app_id when any
+		// of them had allow_from matching the sender. Filter now applies
+		// uniformly so peers with a concrete allow_chat list actually claim
+		// just those chats.
+		{"p2p subject to allow_chat: blocked when not listed", "oc_abc", "oc_xyz", "p2p", false},
+		{"p2p subject to allow_chat: passes when listed", "oc_xyz", "oc_xyz", "p2p", true},
+		{"p2p wildcard still permits all", "*", "oc_xyz", "p2p", true},
 	}
 
 	for _, tt := range tests {

@@ -2,7 +2,10 @@ package feishu
 
 import (
 	"log/slog"
+	"strings"
 	"sync"
+
+	"github.com/chenhg5/cc-connect/core"
 )
 
 // sharedWSGroup tracks all Platform instances sharing the same Feishu app
@@ -81,4 +84,33 @@ func (g *sharedWSGroup) allPlatforms() []*Platform {
 	result := make([]*Platform, len(g.platforms))
 	copy(result, g.platforms)
 	return result
+}
+
+// isAllowChatWildcard reports whether v means "accept every chat" (empty or "*").
+func isAllowChatWildcard(v string) bool {
+	v = strings.TrimSpace(v)
+	return v == "" || v == "*"
+}
+
+// chatClaimedByConcretePeer returns true if another platform in the same
+// shared WS group has a non-wildcard allow_chat that explicitly names chatID.
+// Used so a wildcard project (allow_chat="*") automatically yields that chat
+// to the peer that specifically claimed it — preventing the same message
+// from being processed by multiple projects that share one Feishu app.
+func chatClaimedByConcretePeer(self *Platform, chatID string) bool {
+	if self == nil || self.sharedGroup == nil || chatID == "" {
+		return false
+	}
+	for _, sib := range self.sharedGroup.allPlatforms() {
+		if sib == self {
+			continue
+		}
+		if isAllowChatWildcard(sib.allowChat) {
+			continue
+		}
+		if core.AllowList(sib.allowChat, chatID) {
+			return true
+		}
+	}
+	return false
 }
