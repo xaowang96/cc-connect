@@ -12,6 +12,7 @@ type projectStateData struct {
 	WorkDirOverride         string            `json:"work_dir_override,omitempty"`
 	WorkspaceDirOverrides   map[string]string `json:"workspace_dir_overrides,omitempty"`
 	WorkspaceModelOverrides map[string]string `json:"workspace_model_overrides,omitempty"`
+	AgentBindings           map[string]string `json:"agent_bindings,omitempty"` // channelKey → agentType
 }
 
 // ProjectStateStore persists lightweight runtime state for one project.
@@ -103,6 +104,49 @@ func (ps *ProjectStateStore) ClearWorkspaceModelOverride(workspace string) {
 	if len(ps.state.WorkspaceModelOverrides) == 0 {
 		ps.state.WorkspaceModelOverrides = nil
 	}
+}
+
+func (ps *ProjectStateStore) AgentBinding(channelKey string) string {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	if ps.state.AgentBindings == nil {
+		return ""
+	}
+	return ps.state.AgentBindings[channelKey]
+}
+
+func (ps *ProjectStateStore) SetAgentBinding(channelKey, agentType string) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if ps.state.AgentBindings == nil {
+		ps.state.AgentBindings = make(map[string]string)
+	}
+	ps.state.AgentBindings[channelKey] = agentType
+}
+
+func (ps *ProjectStateStore) ClearAgentBinding(channelKey string) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if ps.state.AgentBindings == nil {
+		return
+	}
+	delete(ps.state.AgentBindings, channelKey)
+	if len(ps.state.AgentBindings) == 0 {
+		ps.state.AgentBindings = nil
+	}
+}
+
+func (ps *ProjectStateStore) ListAgentBindings() map[string]string {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	if ps.state.AgentBindings == nil {
+		return map[string]string{}
+	}
+	result := make(map[string]string, len(ps.state.AgentBindings))
+	for k, v := range ps.state.AgentBindings {
+		result[k] = v
+	}
+	return result
 }
 
 func (ps *ProjectStateStore) ClearWorkDirOverride() {

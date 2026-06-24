@@ -311,7 +311,7 @@ func TestSessionContextForKey_MissingSharedBindingFallsBack(t *testing.T) {
 	if sessions != e.sessions {
 		t.Fatal("expected base session manager for missing shared binding")
 	}
-	if got := e.workspacePool.Get(normalizeWorkspacePath(missingDir)); got != nil {
+	if got := e.workspacePool.Get(e.agent.Name(), normalizeWorkspacePath(missingDir)); got != nil {
 		t.Fatal("did not expect workspace pool entry for missing shared binding")
 	}
 }
@@ -340,7 +340,7 @@ func TestSessionContextForKey_SharedBinding(t *testing.T) {
 	if sessions == e.sessions {
 		t.Fatal("expected workspace session manager, got base session manager")
 	}
-	if got := e.workspacePool.Get(normalizeWorkspacePath(wsDir)); got == nil || got.agent == nil || got.sessions == nil {
+	if got := e.workspacePool.Get(e.agent.Name(), normalizeWorkspacePath(wsDir)); got == nil || got.agent == nil || got.sessions == nil {
 		t.Fatal("expected workspace pool entry to be created for shared binding")
 	}
 }
@@ -544,7 +544,7 @@ func TestMultiWorkspaceAgent_PropagatesRunAsUser(t *testing.T) {
 
 	// Trigger per-workspace agent creation via the path the production
 	// code uses when a message arrives for a resolved workspace.
-	_, _, err := e.getOrCreateWorkspaceAgent(workspaceDir)
+	_, _, err := e.getOrCreateWorkspaceAgent(e.defaultAgentType, workspaceDir)
 	if err != nil {
 		t.Fatalf("getOrCreateWorkspaceAgent: %v", err)
 	}
@@ -606,7 +606,7 @@ func TestMultiWorkspaceAgent_NoPropagationWhenParentHasNoRunAs(t *testing.T) {
 	e := NewEngine("test", parent, nil, "", LangEnglish)
 	e.SetMultiWorkspace(baseDir, filepath.Join(t.TempDir(), "bindings.json"))
 
-	_, _, err := e.getOrCreateWorkspaceAgent(workspaceDir)
+	_, _, err := e.getOrCreateWorkspaceAgent(e.defaultAgentType, workspaceDir)
 	if err != nil {
 		t.Fatalf("getOrCreateWorkspaceAgent: %v", err)
 	}

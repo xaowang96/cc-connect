@@ -583,6 +583,20 @@ const (
 	MsgBuiltinCmdDir       MsgKey = "dir"
 	MsgBuiltinCmdDiff      MsgKey = "diff"
 	MsgBuiltinCmdPs        MsgKey = "ps"
+	MsgBuiltinCmdAgent     MsgKey = "agent"
+
+	// /agent command keys
+	MsgBuiltinCmdAgentDesc    MsgKey = "builtin_cmd_agent_desc"
+	MsgAgentListHeader        MsgKey = "agent_list_header"
+	MsgAgentListItem          MsgKey = "agent_list_item"
+	MsgAgentCurrent           MsgKey = "agent_current"
+	MsgAgentSwitchOK          MsgKey = "agent_switch_ok"
+	MsgAgentSwitchUnknown     MsgKey = "agent_switch_unknown"
+	MsgAgentSwitchSameType    MsgKey = "agent_switch_same_type"
+	MsgAgentSwitchUnavailable MsgKey = "agent_switch_unavailable"
+	MsgAgentUsage             MsgKey = "agent_usage"
+	MsgAgentSwitchInFlight    MsgKey = "agent_switch_in_flight"
+	MsgAgentNotMultiAgent     MsgKey = "agent_not_multi_agent"
 
 	MsgDiffEmpty       MsgKey = "diff_empty"
 	MsgDiffNoDiff2HTML MsgKey = "diff_no_diff2html"
@@ -4191,6 +4205,83 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "`/workspace init` 未啟用本機目錄目標。請使用 git 倉庫地址，或在此專案配置 `workspace_init_allow_local_paths = true`。",
 		LangJapanese:           "`/workspace init` ではローカルディレクトリ対象が無効です。git URL を使うか、このプロジェクトで `workspace_init_allow_local_paths = true` を有効にしてください。",
 		LangSpanish:            "Los destinos de directorio local están deshabilitados para `/workspace init`. Use una URL de git o habilite `workspace_init_allow_local_paths = true` para este proyecto.",
+	},
+	MsgBuiltinCmdAgentDesc: {
+		LangEnglish:            "Switch agent type for this chat",
+		LangChinese:            "切换本会话使用的 Agent 类型",
+		LangTraditionalChinese: "切換本會話使用的 Agent 類型",
+		LangJapanese:           "このチャットの Agent タイプを切り替え",
+		LangSpanish:            "Cambiar el tipo de agente para este chat",
+	},
+	MsgAgentListHeader: {
+		LangEnglish:            "Available agents:",
+		LangChinese:            "可用的 Agent：",
+		LangTraditionalChinese: "可用的 Agent：",
+		LangJapanese:           "利用可能な Agent：",
+		LangSpanish:            "Agentes disponibles:",
+	},
+	MsgAgentListItem: {
+		LangEnglish:            "%s (default)",
+		LangChinese:            "%s（默认）",
+		LangTraditionalChinese: "%s（預設）",
+		LangJapanese:           "%s（デフォルト）",
+		LangSpanish:            "%s (predeterminado)",
+	},
+	MsgAgentCurrent: {
+		LangEnglish:            "Current agent for this chat: %s",
+		LangChinese:            "本会话当前使用的 Agent：%s",
+		LangTraditionalChinese: "本會話目前使用的 Agent：%s",
+		LangJapanese:           "このチャットの現在の Agent：%s",
+		LangSpanish:            "Agente actual para este chat: %s",
+	},
+	MsgAgentSwitchOK: {
+		LangEnglish:            "Switched to %s. Subsequent messages will route to the new agent.",
+		LangChinese:            "已切换到 %s。后续消息将路由到新的 Agent。",
+		LangTraditionalChinese: "已切換到 %s。後續訊息將路由到新的 Agent。",
+		LangJapanese:           "%s に切り替えました。以降のメッセージは新しい Agent にルーティングされます。",
+		LangSpanish:            "Cambiado a %s. Los mensajes posteriores se enrutarán al nuevo agente.",
+	},
+	MsgAgentSwitchUnknown: {
+		LangEnglish:            "Unknown agent type %q. Run /agent list to see available types.",
+		LangChinese:            "未知的 Agent 类型 %q。请运行 /agent list 查看可用类型。",
+		LangTraditionalChinese: "未知的 Agent 類型 %q。請執行 /agent list 查看可用類型。",
+		LangJapanese:           "不明な Agent タイプ %q。/agent list で利用可能なタイプを確認してください。",
+		LangSpanish:            "Tipo de agente desconocido %q. Ejecute /agent list para ver los tipos disponibles.",
+	},
+	MsgAgentSwitchSameType: {
+		LangEnglish:            "Already using %s; no change.",
+		LangChinese:            "已经在使用 %s，无需切换。",
+		LangTraditionalChinese: "已經在使用 %s，無需切換。",
+		LangJapanese:           "既に %s を使用中です。変更はありません。",
+		LangSpanish:            "Ya se está usando %s; sin cambios.",
+	},
+	MsgAgentSwitchUnavailable: {
+		LangEnglish:            "Agent type %q is registered but not declared in this project's agent_templates.",
+		LangChinese:            "Agent 类型 %q 已注册但未在本项目的 agent_templates 中声明。",
+		LangTraditionalChinese: "Agent 類型 %q 已註冊但未在本專案的 agent_templates 中宣告。",
+		LangJapanese:           "Agent タイプ %q は登録されていますが、このプロジェクトの agent_templates で宣言されていません。",
+		LangSpanish:            "El tipo de agente %q está registrado pero no declarado en agent_templates de este proyecto.",
+	},
+	MsgAgentUsage: {
+		LangEnglish:            "Usage: /agent list | /agent current | /agent switch <type>",
+		LangChinese:            "用法：/agent list | /agent current | /agent switch <类型>",
+		LangTraditionalChinese: "用法：/agent list | /agent current | /agent switch <類型>",
+		LangJapanese:           "使い方：/agent list | /agent current | /agent switch <タイプ>",
+		LangSpanish:            "Uso: /agent list | /agent current | /agent switch <tipo>",
+	},
+	MsgAgentSwitchInFlight: {
+		LangEnglish:            "Stopping current %s session before switching to %s…",
+		LangChinese:            "正在停止当前 %s 会话，然后切换到 %s…",
+		LangTraditionalChinese: "正在停止目前 %s 會話，然後切換到 %s…",
+		LangJapanese:           "現在の %s セッションを停止してから %s に切り替えます…",
+		LangSpanish:            "Deteniendo la sesión actual de %s antes de cambiar a %s…",
+	},
+	MsgAgentNotMultiAgent: {
+		LangEnglish:            "This project has no agent_templates configured; /agent is disabled.",
+		LangChinese:            "本项目未配置 agent_templates，/agent 已禁用。",
+		LangTraditionalChinese: "本專案未設定 agent_templates，/agent 已停用。",
+		LangJapanese:           "このプロジェクトには agent_templates が設定されていません。/agent は無効です。",
+		LangSpanish:            "Este proyecto no tiene agent_templates configurados; /agent está deshabilitado.",
 	},
 }
 

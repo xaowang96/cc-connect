@@ -167,3 +167,26 @@ func TestIsJapanese(t *testing.T) {
 		t.Error("ASCII 'a' should not be Japanese")
 	}
 }
+
+func TestI18N_AllAgentKeysCoverAllLocales(t *testing.T) {
+	keys := []MsgKey{
+		MsgBuiltinCmdAgentDesc, MsgAgentListHeader, MsgAgentListItem,
+		MsgAgentCurrent, MsgAgentSwitchOK, MsgAgentSwitchUnknown,
+		MsgAgentSwitchSameType, MsgAgentSwitchUnavailable, MsgAgentUsage,
+		MsgAgentSwitchInFlight, MsgAgentNotMultiAgent,
+	}
+	locales := []Language{LangEnglish, LangChinese, LangTraditionalChinese, LangJapanese, LangSpanish}
+	for _, key := range keys {
+		for _, lang := range locales {
+			entry, ok := messages[key]
+			if !ok {
+				t.Errorf("key %q missing from messages map", key)
+				continue
+			}
+			val, ok := entry[lang]
+			if !ok || val == "" {
+				t.Errorf("key %q has empty or missing translation for locale %q", key, lang)
+			}
+		}
+	}
+}

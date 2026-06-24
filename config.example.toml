@@ -968,6 +968,27 @@ mode = "default" # "default" | "acceptEdits" (edit) | "plan" | "auto" | "bypassP
 # marker_style = "emoji"            # none | ascii | emoji
 # enclosure_style = "code"          # none | bracket | angle | fullwidth | code
 
+# Per-agent-type templates for /agent switch support.
+# Each template declares an agent type that group chats can switch to via
+# /agent switch <type>. The project's [projects.agent] block remains the
+# default for chats that have not switched.
+#
+# Only `type` is required. Options is optional — when omitted, the agent
+# uses its own default configuration (e.g. ~/.codex/config.toml for codex,
+# opencode's own settings). Override only what you want to change:
+#
+# [[projects.agent_templates]]
+# type = "codex"
+# # options is omitted → codex uses ~/.codex/config.toml
+#
+# [[projects.agent_templates]]
+# type = "opencode"
+# # options is omitted → opencode uses its default settings
+#
+# [[projects.agent_templates]]
+# type = "gemini"
+# options = { model = "gemini-2.5-pro" }   # override just the model
+
 # Feishu / Lark / 飞书
 # 1. Create an app at https://open.feishu.cn / 在 https://open.feishu.cn 创建应用
 # 2. Enable Bot capability / 开启机器人能力

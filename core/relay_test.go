@@ -336,7 +336,7 @@ func TestHandleRelay_MultiWorkspaceRoutesBySourceSessionKey(t *testing.T) {
 
 	normalizedWsDir := normalizeWorkspacePath(wsDir)
 	workspaceAgent := &sessionEnvRecordingAgent{session: newResultAgentSession("workspace")}
-	ws := e.workspacePool.GetOrCreate(normalizedWsDir)
+	ws := e.workspacePool.GetOrCreate(e.agent.Name(), normalizedWsDir)
 	ws.agent = workspaceAgent
 	ws.sessions = NewSessionManager("")
 

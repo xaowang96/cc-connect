@@ -10,9 +10,9 @@ import (
 func TestWorkspacePool_GetOrCreate(t *testing.T) {
 	pool := newWorkspacePool(15 * time.Minute)
 
-	state1 := pool.GetOrCreate("/workspace/a")
-	state2 := pool.GetOrCreate("/workspace/a")
-	state3 := pool.GetOrCreate("/workspace/b")
+	state1 := pool.GetOrCreate("test", "/workspace/a")
+	state2 := pool.GetOrCreate("test", "/workspace/a")
+	state3 := pool.GetOrCreate("test", "/workspace/b")
 
 	if state1 != state2 {
 		t.Error("expected same state for same workspace")
@@ -24,7 +24,7 @@ func TestWorkspacePool_GetOrCreate(t *testing.T) {
 
 func TestWorkspacePool_Touch(t *testing.T) {
 	pool := newWorkspacePool(15 * time.Minute)
-	state := pool.GetOrCreate("/workspace/a")
+	state := pool.GetOrCreate("test", "/workspace/a")
 
 	before := state.LastActivity()
 	time.Sleep(10 * time.Millisecond)
@@ -37,7 +37,7 @@ func TestWorkspacePool_Touch(t *testing.T) {
 }
 
 func TestWorkspaceState_BeginEndTurn(t *testing.T) {
-	state := newWorkspaceState("/workspace/a")
+	state := newWorkspaceState("test", "/workspace/a")
 
 	before := state.LastActivity()
 	time.Sleep(10 * time.Millisecond)
@@ -62,16 +62,17 @@ func TestWorkspaceState_BeginEndTurn(t *testing.T) {
 
 func TestWorkspacePool_ReapIdle(t *testing.T) {
 	pool := newWorkspacePool(50 * time.Millisecond)
-	pool.GetOrCreate(normalizeWorkspacePath("/workspace/a"))
+	pool.GetOrCreate("test", normalizeWorkspacePath("/workspace/a"))
 
 	time.Sleep(100 * time.Millisecond)
 	reaped := pool.ReapIdle()
 
-	if len(reaped) != 1 || reaped[0] != normalizeWorkspacePath("/workspace/a") {
-		t.Errorf("expected [%s] reaped, got %v", normalizeWorkspacePath("/workspace/a"), reaped)
+	wantWS := normalizeWorkspacePath("/workspace/a")
+	if len(reaped) != 1 || reaped[0].workspace != wantWS {
+		t.Errorf("expected [%s] reaped, got %v", wantWS, reaped)
 	}
 
-	if s := pool.Get(normalizeWorkspacePath("/workspace/a")); s != nil {
+	if s := pool.Get("test", normalizeWorkspacePath("/workspace/a")); s != nil {
 		t.Error("expected workspace removed after reap")
 	}
 }
@@ -125,9 +126,8 @@ func TestNormalizeBeforePoolProducesSameKey(t *testing.T) {
 
 	pool := newWorkspacePool(15 * time.Minute)
 
-	// Callers normalize before pool access (as resolveWorkspace does)
-	ws1 := pool.GetOrCreate(normalizeWorkspacePath(realDir + "/"))
-	ws2 := pool.GetOrCreate(normalizeWorkspacePath(realDir))
+	ws1 := pool.GetOrCreate("test", normalizeWorkspacePath(realDir+"/"))
+	ws2 := pool.GetOrCreate("test", normalizeWorkspacePath(realDir))
 
 	if ws1 != ws2 {
 		t.Error("normalized trailing slash produced a different workspace state")
@@ -136,24 +136,24 @@ func TestNormalizeBeforePoolProducesSameKey(t *testing.T) {
 
 func TestWorkspacePool_ReapIdle_KeepsActive(t *testing.T) {
 	pool := newWorkspacePool(200 * time.Millisecond)
-	state := pool.GetOrCreate("/workspace/active")
+	state := pool.GetOrCreate("test", "/workspace/active")
 
 	time.Sleep(100 * time.Millisecond)
-	state.Touch() // Keep it alive
+	state.Touch()
 
 	reaped := pool.ReapIdle()
 	if len(reaped) != 0 {
 		t.Errorf("expected no reaping for active workspace, got %v", reaped)
 	}
 
-	if s := pool.Get("/workspace/active"); s == nil {
+	if s := pool.Get("test", "/workspace/active"); s == nil {
 		t.Error("expected active workspace to still exist")
 	}
 }
 
 func TestWorkspacePool_ReapIdle_SkipsBusyWorkspace(t *testing.T) {
 	pool := newWorkspacePool(50 * time.Millisecond)
-	state := pool.GetOrCreate(normalizeWorkspacePath("/workspace/busy"))
+	state := pool.GetOrCreate("test", normalizeWorkspacePath("/workspace/busy"))
 	state.BeginTurn()
 
 	time.Sleep(100 * time.Millisecond)
@@ -161,14 +161,15 @@ func TestWorkspacePool_ReapIdle_SkipsBusyWorkspace(t *testing.T) {
 	if len(reaped) != 0 {
 		t.Fatalf("expected busy workspace to be preserved, got %v", reaped)
 	}
-	if got := pool.Get(normalizeWorkspacePath("/workspace/busy")); got == nil {
+	if got := pool.Get("test", normalizeWorkspacePath("/workspace/busy")); got == nil {
 		t.Fatal("expected busy workspace to remain in pool")
 	}
 
 	state.EndTurn()
 	time.Sleep(60 * time.Millisecond)
 	reaped = pool.ReapIdle()
-	if len(reaped) != 1 || reaped[0] != normalizeWorkspacePath("/workspace/busy") {
+	wantWS := normalizeWorkspacePath("/workspace/busy")
+	if len(reaped) != 1 || reaped[0].workspace != wantWS {
 		t.Fatalf("expected busy workspace to reap after EndTurn, got %v", reaped)
 	}
 }
@@ -203,5 +204,90 @@ func TestInteractiveKeyForSessionKey_NormalizesWorkspace(t *testing.T) {
 	key2 := e.interactiveKeyForSessionKey(sessionKey)
 	if key != key2 {
 		t.Errorf("keys should be identical regardless of trailing slash\nslash:   %s\nclean:   %s", key, key2)
+	}
+}
+
+func TestWorkspacePool_KeyedByAgentType(t *testing.T) {
+	pool := newWorkspacePool(15 * time.Minute)
+	ws := "/path/to/ws"
+
+	stateA := pool.GetOrCreate("claudecode", ws)
+	stateB := pool.GetOrCreate("codex", ws)
+
+	if stateA == stateB {
+		t.Fatal("expected different states for different agent types with same workspace")
+	}
+	if len(pool.states) != 2 {
+		t.Fatalf("expected 2 pool entries, got %d", len(pool.states))
+	}
+
+	stateA2 := pool.GetOrCreate("claudecode", ws)
+	if stateA2 != stateA {
+		t.Error("expected cache hit for same (agentType, workspace) pair")
+	}
+	if len(pool.states) != 2 {
+		t.Fatalf("expected still 2 pool entries after cache hit, got %d", len(pool.states))
+	}
+
+	if stateA.agentType != "claudecode" {
+		t.Errorf("stateA.agentType = %q, want %q", stateA.agentType, "claudecode")
+	}
+	if stateB.agentType != "codex" {
+		t.Errorf("stateB.agentType = %q, want %q", stateB.agentType, "codex")
+	}
+}
+
+// TestRegression_IdleReaper_DoesNotReapBusyTypedAgent verifies that the idle
+// reaper preserves busy (activeTurns > 0) workspace states even when past the
+// idle timeout, while reaping idle states in the same pool. The returned
+// reapedWorkspace struct must carry the correct agentType — critical for
+// logging the right agent when multiple agent types coexist.
+//
+// Regression for: after /agent switch codex, the pool contains entries for
+// both "codex" and "claudecode". The reaper must not conflate them.
+func TestRegression_IdleReaper_DoesNotReapBusyTypedAgent(t *testing.T) {
+	pool := newWorkspacePool(50 * time.Millisecond)
+
+	busyWS := normalizeWorkspacePath("/workspace/codex-busy")
+	busyState := pool.GetOrCreate("codex", busyWS)
+	busyState.BeginTurn()
+
+	idleWS := normalizeWorkspacePath("/workspace/claude-idle")
+	pool.GetOrCreate("claudecode", idleWS)
+
+	time.Sleep(100 * time.Millisecond)
+
+	reaped := pool.ReapIdle()
+
+	if len(reaped) != 1 {
+		t.Fatalf("expected 1 reaped workspace, got %d: %+v", len(reaped), reaped)
+	}
+	if reaped[0].agentType != "claudecode" {
+		t.Errorf("reaped agentType = %q, want %q", reaped[0].agentType, "claudecode")
+	}
+	if reaped[0].workspace != idleWS {
+		t.Errorf("reaped workspace = %q, want %q", reaped[0].workspace, idleWS)
+	}
+
+	if got := pool.Get("codex", busyWS); got == nil {
+		t.Fatal("expected busy codex workspace to remain in pool after reap")
+	}
+	if got := pool.Get("claudecode", idleWS); got != nil {
+		t.Fatal("expected idle claudecode workspace to be removed from pool")
+	}
+
+	busyState.EndTurn()
+	time.Sleep(100 * time.Millisecond)
+
+	reaped2 := pool.ReapIdle()
+
+	if len(reaped2) != 1 {
+		t.Fatalf("expected 1 reaped workspace after EndTurn, got %d: %+v", len(reaped2), reaped2)
+	}
+	if reaped2[0].agentType != "codex" {
+		t.Errorf("reaped agentType = %q, want %q", reaped2[0].agentType, "codex")
+	}
+	if reaped2[0].workspace != busyWS {
+		t.Errorf("reaped workspace = %q, want %q", reaped2[0].workspace, busyWS)
 	}
 }

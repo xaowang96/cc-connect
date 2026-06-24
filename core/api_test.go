@@ -251,7 +251,7 @@ func TestHandleSend_WorkDirStartsSideSession(t *testing.T) {
 		t.Fatalf("platform sent = %#v, want direct send of request content", sent)
 	}
 
-	_, sessions, err := engine.getOrCreateWorkspaceAgent(targetDir)
+	_, sessions, err := engine.getOrCreateWorkspaceAgent(engine.defaultAgentType, targetDir)
 	if err != nil {
 		t.Fatalf("get workspace agent: %v", err)
 	}

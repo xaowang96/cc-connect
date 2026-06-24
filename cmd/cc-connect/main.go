@@ -448,6 +448,17 @@ func main() {
 		engine.SetProjectStateStore(projectState)
 		engine.SetDataDir(cfg.DataDir)
 
+		// Register switchable agent templates for /agent switch support
+		if len(proj.AgentTemplates) > 0 {
+			templates := buildAgentTemplates(proj.AgentTemplates)
+			engine.SetAgentTemplates(templates)
+			types := make([]string, 0, len(templates))
+			for t := range templates {
+				types = append(types, t)
+			}
+			slog.Info("agent templates registered", "project", proj.Name, "count", len(templates), "types", types)
+		}
+
 		// Wire multi-workspace mode
 		if proj.Mode == "multi-workspace" {
 			baseDir := proj.BaseDir
@@ -2008,4 +2019,16 @@ func derefInt(v *int) int {
 		return 0
 	}
 	return *v
+}
+
+func buildAgentTemplates(templates []config.AgentConfig) map[string]core.AgentConfigTemplate {
+	result := make(map[string]core.AgentConfigTemplate, len(templates))
+	for _, t := range templates {
+		result[t.Type] = core.AgentConfigTemplate{
+			Type:         t.Type,
+			Options:      t.Options,
+			ProviderRefs: t.ProviderRefs,
+		}
+	}
+	return result
 }

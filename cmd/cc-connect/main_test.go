@@ -340,3 +340,79 @@ func TestCanonicalCronSubcommand_ManualTriggerAliases(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildAgentTemplates_ConvertsConfigTemplatesToCoreTemplates(t *testing.T) {
+	// Given: a config with two switchable agent templates carrying options and provider refs
+	templates := []config.AgentConfig{
+		{
+			Type:         "codex",
+			Options:      map[string]any{"shell": "/bin/zsh", "reasoning": "high"},
+			ProviderRefs: []string{"openai-prod", "openai-eu"},
+		},
+		{
+			Type:         "opencode",
+			Options:      map[string]any{"model": "claude-sonnet-4"},
+			ProviderRefs: []string{"anthropic-prod"},
+		},
+	}
+
+	// When: the templates are translated to the core-layer representation
+	got := buildAgentTemplates(templates)
+
+	// Then: the map has one entry per template keyed by agent type
+	if len(got) != 2 {
+		t.Fatalf("len(got) = %d, want 2", len(got))
+	}
+
+	codex, ok := got["codex"]
+	if !ok {
+		t.Fatalf("missing entry for codex")
+	}
+	if codex.Type != "codex" {
+		t.Fatalf("codex.Type = %q, want codex", codex.Type)
+	}
+	if codex.Options["shell"] != "/bin/zsh" {
+		t.Fatalf("codex.Options[shell] = %v, want /bin/zsh", codex.Options["shell"])
+	}
+	if !reflect.DeepEqual(codex.ProviderRefs, []string{"openai-prod", "openai-eu"}) {
+		t.Fatalf("codex.ProviderRefs = %v, want [openai-prod openai-eu]", codex.ProviderRefs)
+	}
+
+	opencode, ok := got["opencode"]
+	if !ok {
+		t.Fatalf("missing entry for opencode")
+	}
+	if opencode.Type != "opencode" {
+		t.Fatalf("opencode.Type = %q, want opencode", opencode.Type)
+	}
+	if opencode.Options["model"] != "claude-sonnet-4" {
+		t.Fatalf("opencode.Options[model] = %v, want claude-sonnet-4", opencode.Options["model"])
+	}
+	if !reflect.DeepEqual(opencode.ProviderRefs, []string{"anthropic-prod"}) {
+		t.Fatalf("opencode.ProviderRefs = %v, want [anthropic-prod]", opencode.ProviderRefs)
+	}
+}
+
+func TestBuildAgentTemplates_EmptyInputReturnsEmptyMap(t *testing.T) {
+	got := buildAgentTemplates(nil)
+	if got == nil {
+		t.Fatalf("got = nil, want non-nil empty map")
+	}
+	if len(got) != 0 {
+		t.Fatalf("len(got) = %d, want 0", len(got))
+	}
+}
+
+func TestBuildAgentTemplates_DuplicateTypeLastWins(t *testing.T) {
+	templates := []config.AgentConfig{
+		{Type: "codex", Options: map[string]any{"reasoning": "low"}},
+		{Type: "codex", Options: map[string]any{"reasoning": "high"}},
+	}
+	got := buildAgentTemplates(templates)
+	if len(got) != 1 {
+		t.Fatalf("len(got) = %d, want 1 (last wins for duplicate type)", len(got))
+	}
+	if got["codex"].Options["reasoning"] != "high" {
+		t.Fatalf("reasoning = %v, want high (last wins)", got["codex"].Options["reasoning"])
+	}
+}

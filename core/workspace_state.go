@@ -23,9 +23,19 @@ func normalizeWorkspacePath(path string) string {
 	return resolved
 }
 
-// workspaceState holds the runtime state for a single workspace.
+// poolKey constructs a composite cache key from agentType and workspace.
+// The \x00 separator prevents collisions between agentType and workspace
+// values that might share a boundary.
+func poolKey(agentType, workspace string) string {
+	return agentType + "\x00" + workspace
+}
+
+// workspaceState holds the runtime state for a single workspace bound to
+// a specific agent type. The agentType field is stored alongside workspace
+// for logging/debugging in reap output.
 type workspaceState struct {
 	mu           sync.Mutex
+	agentType    string
 	workspace    string
 	sessions     *SessionManager
 	agent        Agent
@@ -33,8 +43,9 @@ type workspaceState struct {
 	activeTurns  int
 }
 
-func newWorkspaceState(workspace string) *workspaceState {
+func newWorkspaceState(agentType, workspace string) *workspaceState {
 	return &workspaceState{
+		agentType:    agentType,
 		workspace:    workspace,
 		lastActivity: time.Now(),
 	}
@@ -75,9 +86,11 @@ func (ws *workspaceState) LastActivity() time.Time {
 }
 
 // workspacePool manages a set of workspace states with idle reaping.
+// Keys are composite (agentType + "\x00" + workspace) so that different
+// agent types get independent pool entries even for the same workspace.
 type workspacePool struct {
 	mu          sync.RWMutex
-	states      map[string]*workspaceState // workspace path -> state
+	states      map[string]*workspaceState // poolKey(agentType, workspace) -> state
 	idleTimeout time.Duration
 }
 
@@ -88,10 +101,11 @@ func newWorkspacePool(idleTimeout time.Duration) *workspacePool {
 	}
 }
 
-// Get returns the state for a workspace.
-func (p *workspacePool) Get(workspace string) *workspaceState {
+// Get returns the state for a (agentType, workspace) pair.
+func (p *workspacePool) Get(agentType, workspace string) *workspaceState {
+	key := poolKey(agentType, workspace)
 	p.mu.RLock()
-	state := p.states[workspace]
+	state := p.states[key]
 	p.mu.RUnlock()
 	if state != nil {
 		return state
@@ -102,56 +116,69 @@ func (p *workspacePool) Get(workspace string) *workspaceState {
 		return nil
 	}
 
+	normalizedKey := poolKey(agentType, normalized)
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.states[normalized]
+	return p.states[normalizedKey]
 }
 
-// GetOrCreate returns or creates state for a workspace.
-func (p *workspacePool) GetOrCreate(workspace string) *workspaceState {
+// GetOrCreate returns or creates state for a (agentType, workspace) pair.
+func (p *workspacePool) GetOrCreate(agentType, workspace string) *workspaceState {
+	key := poolKey(agentType, workspace)
 	p.mu.Lock()
-	if s, ok := p.states[workspace]; ok {
+	if s, ok := p.states[key]; ok {
 		p.mu.Unlock()
 		return s
 	}
 	p.mu.Unlock()
 
 	normalized := normalizeWorkspacePath(workspace)
+	normalizedKey := poolKey(agentType, normalized)
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if s, ok := p.states[workspace]; ok {
+	if s, ok := p.states[key]; ok {
 		return s
 	}
 	if normalized != workspace {
-		if s, ok := p.states[normalized]; ok {
+		if s, ok := p.states[normalizedKey]; ok {
 			return s
 		}
+		key = normalizedKey
 		workspace = normalized
 	}
 
-	s := newWorkspaceState(workspace)
-	p.states[workspace] = s
+	s := newWorkspaceState(agentType, workspace)
+	p.states[key] = s
 	return s
 }
 
-// ReapIdle removes and returns workspace paths that have been idle longer than idleTimeout.
-// A zero idleTimeout disables reaping entirely.
-func (p *workspacePool) ReapIdle() []string {
+// reapedWorkspace carries the identity of a pool entry that was reaped.
+type reapedWorkspace struct {
+	agentType string
+	workspace string
+}
+
+// ReapIdle removes and returns entries that have been idle longer than
+// idleTimeout. A zero idleTimeout disables reaping entirely.
+func (p *workspacePool) ReapIdle() []reapedWorkspace {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.idleTimeout <= 0 {
 		return nil
 	}
 	cutoff := time.Now().Add(-p.idleTimeout)
-	var reaped []string
-	for path, state := range p.states {
+	var reaped []reapedWorkspace
+	for key, state := range p.states {
 		if state.HasActiveTurn() {
 			continue
 		}
 		if state.LastActivity().Before(cutoff) {
-			reaped = append(reaped, path)
-			delete(p.states, path)
+			reaped = append(reaped, reapedWorkspace{
+				agentType: state.agentType,
+				workspace: state.workspace,
+			})
+			delete(p.states, key)
 		}
 	}
 	return reaped

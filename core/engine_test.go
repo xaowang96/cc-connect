@@ -1100,10 +1100,10 @@ func TestProcessInteractiveEvents_NonTerminalResultContinuesTurn(t *testing.T) {
 	session := e.sessions.GetOrCreateActive(sessionKey)
 	agentSession := newControllableSession("s1")
 	state := &interactiveState{
-		agentSession:                  agentSession,
-		platform:                      p,
-		replyCtx:                      "ctx-1",
-		currentTurnUserMessageTimeMs:  100,
+		agentSession:                   agentSession,
+		platform:                       p,
+		replyCtx:                       "ctx-1",
+		currentTurnUserMessageTimeMs:   100,
 		lastCompletedUserMessageTimeMs: 0,
 	}
 	e.interactiveStates[sessionKey] = state
@@ -3004,7 +3004,7 @@ func TestCmdList_MultiWorkspaceUsesWorkspaceSessions(t *testing.T) {
 	channelID := "C123"
 	e.workspaceBindings.Bind("project:test", channelID, "chan", normalizedWsDir)
 
-	ws := e.workspacePool.GetOrCreate(normalizedWsDir)
+	ws := e.workspacePool.GetOrCreate(e.agent.Name(), normalizedWsDir)
 	ws.agent = &stubListAgent{
 		sessions: []AgentSessionInfo{
 			{ID: "w1", Summary: "Workspace One", MessageCount: 2},
@@ -3242,7 +3242,7 @@ func TestHandleMessage_MultiWorkspacePreservesCCSessionKey(t *testing.T) {
 	e.workspaceBindings.Bind("project:test", channelID, "chan", normalizedWsDir)
 
 	wsAgent := &sessionEnvRecordingAgent{session: newResultAgentSession("ok")}
-	ws := e.workspacePool.GetOrCreate(normalizedWsDir)
+	ws := e.workspacePool.GetOrCreate(e.agent.Name(), normalizedWsDir)
 	ws.agent = wsAgent
 	ws.sessions = NewSessionManager("")
 
@@ -4561,7 +4561,7 @@ func TestCmdModel_MultiWorkspaceUsesWorkspaceAgentAndSessions(t *testing.T) {
 	channelID := "C-model"
 	e.workspaceBindings.Bind("project:test", channelID, "chan", wsDir)
 
-	ws := e.workspacePool.GetOrCreate(wsDir)
+	ws := e.workspacePool.GetOrCreate(e.agent.Name(), wsDir)
 	wsAgent := &stubModelModeAgent{model: "gpt-4.1-mini"}
 	ws.agent = wsAgent
 	ws.sessions = NewSessionManager("")
@@ -4602,7 +4602,7 @@ func TestCmdModel_MultiWorkspaceSwitchDoesNotMutateProviderModel(t *testing.T) {
 	channelID := "C-model-provider"
 	e.workspaceBindings.Bind("project:test", channelID, "chan", wsDir)
 
-	ws := e.workspacePool.GetOrCreate(wsDir)
+	ws := e.workspacePool.GetOrCreate(e.agent.Name(), wsDir)
 	wsAgent := &stubModelModeAgent{
 		model: "gpt-4.1-mini",
 		providers: []ProviderConfig{{
@@ -4675,13 +4675,13 @@ func TestCmdModel_MultiWorkspacePersistsWorkspaceModelForRecreatedAgent(t *testi
 		t.Fatalf("WorkspaceModelOverride(%q) = %q, want gpt-4.1", wsDir, got)
 	}
 
-	ws := e.workspacePool.GetOrCreate(wsDir)
+	ws := e.workspacePool.GetOrCreate(e.agent.Name(), wsDir)
 	ws.mu.Lock()
 	ws.agent = nil
 	ws.sessions = nil
 	ws.mu.Unlock()
 
-	recreatedRaw, _, err := e.getOrCreateWorkspaceAgent(wsDir)
+	recreatedRaw, _, err := e.getOrCreateWorkspaceAgent(e.defaultAgentType, wsDir)
 	if err != nil {
 		t.Fatalf("getOrCreateWorkspaceAgent returned error: %v", err)
 	}
@@ -4751,7 +4751,7 @@ func TestGetOrCreateWorkspaceAgent_InheritsActiveProvider(t *testing.T) {
 	e := NewEngine("test", globalAgent, []Platform{&stubPlatformEngine{n: "plain"}}, "", LangEnglish)
 	e.SetMultiWorkspace(t.TempDir(), filepath.Join(t.TempDir(), "bindings.json"))
 
-	wsAgentRaw, _, err := e.getOrCreateWorkspaceAgent(normalizeWorkspacePath(t.TempDir()))
+	wsAgentRaw, _, err := e.getOrCreateWorkspaceAgent(e.defaultAgentType, normalizeWorkspacePath(t.TempDir()))
 	if err != nil {
 		t.Fatalf("getOrCreateWorkspaceAgent returned error: %v", err)
 	}
@@ -4814,7 +4814,7 @@ func TestGetOrCreateWorkspaceAgent_InheritsSnapshotOptions(t *testing.T) {
 	e.SetMultiWorkspace(t.TempDir(), filepath.Join(t.TempDir(), "bindings.json"))
 
 	workspace := normalizeWorkspacePath(t.TempDir())
-	wsAgentRaw, _, err := e.getOrCreateWorkspaceAgent(workspace)
+	wsAgentRaw, _, err := e.getOrCreateWorkspaceAgent(e.defaultAgentType, workspace)
 	if err != nil {
 		t.Fatalf("getOrCreateWorkspaceAgent returned error: %v", err)
 	}
@@ -5374,7 +5374,7 @@ func TestCmdReasoning_MultiWorkspaceSavesToWorkspaceSessions(t *testing.T) {
 	channelID := "C-reasoning-ws"
 	e.workspaceBindings.Bind("project:test", channelID, "chan", wsDir)
 
-	ws := e.workspacePool.GetOrCreate(wsDir)
+	ws := e.workspacePool.GetOrCreate(e.agent.Name(), wsDir)
 	wsAgent := &stubModelModeAgent{}
 	ws.agent = wsAgent
 	ws.sessions = NewSessionManager("")
@@ -5426,7 +5426,7 @@ func TestCmdProvider_ClearMultiWorkspaceUsesWorkspaceSessions(t *testing.T) {
 	channelID := "C-provider-clear-ws"
 	e.workspaceBindings.Bind("project:test", channelID, "chan", wsDir)
 
-	ws := e.workspacePool.GetOrCreate(wsDir)
+	ws := e.workspacePool.GetOrCreate(e.agent.Name(), wsDir)
 	wsAgent := &stubProviderAgent{
 		providers: []ProviderConfig{{Name: "openai"}},
 		active:    "openai",
@@ -5481,7 +5481,7 @@ func TestSwitchProvider_MultiWorkspaceUsesWorkspaceSessions(t *testing.T) {
 	channelID := "C-provider-switch-ws"
 	e.workspaceBindings.Bind("project:test", channelID, "chan", wsDir)
 
-	ws := e.workspacePool.GetOrCreate(wsDir)
+	ws := e.workspacePool.GetOrCreate(e.agent.Name(), wsDir)
 	wsAgent := &stubProviderAgent{
 		providers: []ProviderConfig{{Name: "openai"}, {Name: "azure"}},
 		active:    "openai",
@@ -8944,7 +8944,7 @@ func TestHandleCardNav_ModelUsesWorkspaceContext(t *testing.T) {
 	sessionKey := "feishu:" + channelID + ":user1"
 	e.workspaceBindings.Bind("project:test", channelID, "chan", wsDir)
 
-	ws := e.workspacePool.GetOrCreate(wsDir)
+	ws := e.workspacePool.GetOrCreate(e.agent.Name(), wsDir)
 	wsAgent := &stubModelModeAgent{model: "workspace-old"}
 	ws.agent = wsAgent
 	ws.sessions = NewSessionManager("")
@@ -9042,7 +9042,7 @@ func TestHandleCardNav_ModelCardUsesWorkspaceAgent(t *testing.T) {
 	sessionKey := "feishu:" + channelID + ":user1"
 	e.workspaceBindings.Bind("project:test", channelID, "chan", wsDir)
 
-	ws := e.workspacePool.GetOrCreate(wsDir)
+	ws := e.workspacePool.GetOrCreate(e.agent.Name(), wsDir)
 	ws.agent = &stubModelModeAgent{model: "workspace-model"}
 	ws.sessions = NewSessionManager("")
 
@@ -13744,7 +13744,7 @@ func TestWorkspaceIdleTimeout_Configurable(t *testing.T) {
 // when idleTimeout is zero.
 func TestReapIdle_DisabledWhenZeroTimeout(t *testing.T) {
 	pool := newWorkspacePool(0)
-	ws := pool.GetOrCreate("/test/workspace")
+	ws := pool.GetOrCreate("test", "/test/workspace")
 	ws.Touch()
 	// Even with an existing workspace, zero timeout disables reaping.
 	reaped := pool.ReapIdle()
@@ -14972,8 +14972,8 @@ func TestIsAllowResponse_WithMultipleMentions(t *testing.T) {
 func TestIsAllowResponse_NotInsideOtherWord(t *testing.T) {
 	cases := []string{
 		"禁止允许这种",
-		"不允许这样",   // "不允许" has its own deny entry, but as part of "不允许这样" the user clearly is denying / negating, never allowing.
-		"我不太允许这件事", // long sentence, no token equals "允许"
+		"不允许这样",                            // "不允许" has its own deny entry, but as part of "不允许这样" the user clearly is denying / negating, never allowing.
+		"我不太允许这件事",                         // long sentence, no token equals "允许"
 		"please don't allowall the things", // FieldsFunc keeps "allowall" intact, but it is the approveAll single-token form, not allow.
 		"hello world",
 		"",
@@ -15001,7 +15001,7 @@ func TestIsDenyResponse_WithMention(t *testing.T) {
 	}
 
 	negatives := []string{
-		"拒绝症患者",       // embedded — must not match
+		"拒绝症患者",        // embedded — must not match
 		"我们都不应该 hello", // unrelated
 	}
 	for _, s := range negatives {

@@ -438,6 +438,20 @@ start if any gate fails or if the probe detects a cross-user leak.
 
 ---
 
+### 🤖 Multi-Agent Selection
+
+**Per-Chat Agent Switching** — In a project with `agent_templates` configured, switch the agent type for a group chat on the fly:
+
+```
+/agent list              List available agent types
+/agent current           Show current agent for this chat
+/agent switch codex      Switch to Codex (admin only)
+```
+
+The binding persists across restarts. Each agent type has independent sessions, models, and providers.
+
+---
+
 ### 🔐 Permission Modes
 
 ```

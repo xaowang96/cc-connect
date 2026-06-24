@@ -476,11 +476,17 @@ type ProjectConfig struct {
 	// init flow to bind existing local directories. Default false keeps init
 	// limited to git URLs; use /workspace bind or /workspace route for explicit
 	// local bindings.
-	WorkspaceInitAllowLocalPaths *bool              `toml:"workspace_init_allow_local_paths,omitempty"`
-	Agent                        AgentConfig        `toml:"agent"`
-	Platforms                    []PlatformConfig   `toml:"platforms"`
-	Heartbeat                    HeartbeatConfig    `toml:"heartbeat"`
-	AutoCompress                 AutoCompressConfig `toml:"auto_compress"`
+	WorkspaceInitAllowLocalPaths *bool       `toml:"workspace_init_allow_local_paths,omitempty"`
+	Agent                        AgentConfig `toml:"agent"`
+	// AgentTemplates declares additional agent definitions that group chats
+	// can switch to via /agent switch <type>. Each template must have a
+	// unique `type` that also differs from the project's default `agent.type`.
+	// The project-level `agent` block remains the default when no /agent
+	// binding exists for a channel.
+	AgentTemplates []AgentConfig      `toml:"agent_templates,omitempty"`
+	Platforms      []PlatformConfig   `toml:"platforms"`
+	Heartbeat      HeartbeatConfig    `toml:"heartbeat"`
+	AutoCompress   AutoCompressConfig `toml:"auto_compress"`
 	// ResetOnIdleMins automatically rotates to a new cc-connect session after
 	// the current session has been inactive for the specified number of minutes.
 	// 0 or nil disables the behavior.
@@ -1036,6 +1042,18 @@ func (c *Config) validateInternal(permissive bool) error {
 			if _, ok := proj.Agent.Options["work_dir"]; ok {
 				return fmt.Errorf("project %q: multi-workspace mode conflicts with agent work_dir (use base_dir instead)", proj.Name)
 			}
+		}
+		seen := make(map[string]bool, len(proj.AgentTemplates)+1)
+		seen[proj.Agent.Type] = true
+		for _, tmpl := range proj.AgentTemplates {
+			t := strings.TrimSpace(tmpl.Type)
+			if t == "" {
+				return fmt.Errorf("project %q: agent template type is required", proj.Name)
+			}
+			if seen[t] {
+				return fmt.Errorf("project %q: duplicate agent template type %q", proj.Name, t)
+			}
+			seen[t] = true
 		}
 		if proj.ResetOnIdleMins != nil && *proj.ResetOnIdleMins < 0 {
 			return fmt.Errorf("config: %s.reset_on_idle_mins must be >= 0", prefix)

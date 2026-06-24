@@ -95,3 +95,35 @@ func TestWorkspaceModelOverride(t *testing.T) {
 		t.Fatalf("WorkspaceModelOverride(%q) after clearing other workspace = %q, want %q", workspaceB, got, "sonnet")
 	}
 }
+
+func TestRegression_ProjectStateStore_AgentBindingsSurviveRestart(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "projects", "demo.state.json")
+	channelKey := "feishu:oc_123"
+
+	store := NewProjectStateStore(statePath)
+	store.SetAgentBinding(channelKey, "codex")
+	store.Save()
+
+	reloaded := NewProjectStateStore(statePath)
+	if got := reloaded.AgentBinding(channelKey); got != "codex" {
+		t.Fatalf("AgentBinding(%q) after restart = %q, want %q", channelKey, got, "codex")
+	}
+	bindings := reloaded.ListAgentBindings()
+	if len(bindings) != 1 {
+		t.Fatalf("ListAgentBindings() after restart has %d entries, want 1", len(bindings))
+	}
+	if got := bindings[channelKey]; got != "codex" {
+		t.Fatalf("ListAgentBindings()[%q] = %q, want %q", channelKey, got, "codex")
+	}
+
+	reloaded.ClearAgentBinding(channelKey)
+	reloaded.Save()
+
+	cleared := NewProjectStateStore(statePath)
+	if got := cleared.AgentBinding(channelKey); got != "" {
+		t.Fatalf("AgentBinding(%q) after clear = %q, want empty", channelKey, got)
+	}
+	if bindings := cleared.ListAgentBindings(); len(bindings) != 0 {
+		t.Fatalf("ListAgentBindings() after clear has %d entries, want 0", len(bindings))
+	}
+}

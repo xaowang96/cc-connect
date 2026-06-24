@@ -3371,3 +3371,73 @@ func TestRemoveGlobalProvider_CleansUpProviderRefs(t *testing.T) {
 		t.Errorf("proj2 provider_refs: want [], got %v", refs2)
 	}
 }
+
+// TestConfig_AgentTemplates_RejectsDuplicateType locks the validation
+// contract for ProjectConfig.AgentTemplates: template types must be
+// non-empty, unique among themselves, and not collide with the project's
+// default agent.type.
+func TestConfig_AgentTemplates_RejectsDuplicateType(t *testing.T) {
+	tmpl := func(agentType string) AgentConfig {
+		return AgentConfig{Type: agentType, Options: map[string]any{"mode": "default"}}
+	}
+
+	t.Run("rejects duplicate type within AgentTemplates", func(t *testing.T) {
+		p := validProject("demo")
+		p.AgentTemplates = []AgentConfig{
+			tmpl("codex"),
+			tmpl("codex"),
+		}
+		cfg := Config{Projects: []ProjectConfig{p}}
+
+		err := cfg.validate()
+		assertErrContains(t, err, `duplicate agent template type "codex"`)
+	})
+
+	t.Run("rejects template type colliding with default agent.type", func(t *testing.T) {
+		p := validProject("demo")
+		// validProject() sets Agent.Type = "claudecode"; a template claiming
+		// the same type would shadow the default.
+		p.AgentTemplates = []AgentConfig{
+			tmpl("codex"),
+			tmpl("claudecode"),
+		}
+		cfg := Config{Projects: []ProjectConfig{p}}
+
+		err := cfg.validate()
+		assertErrContains(t, err, `duplicate agent template type "claudecode"`)
+	})
+
+	t.Run("rejects empty template type", func(t *testing.T) {
+		p := validProject("demo")
+		p.AgentTemplates = []AgentConfig{
+			tmpl("codex"),
+			{Type: "", Options: map[string]any{"mode": "default"}},
+		}
+		cfg := Config{Projects: []ProjectConfig{p}}
+
+		err := cfg.validate()
+		assertErrContains(t, err, "agent template type is required")
+	})
+
+	t.Run("accepts distinct template types", func(t *testing.T) {
+		p := validProject("demo")
+		p.AgentTemplates = []AgentConfig{
+			tmpl("codex"),
+			tmpl("gemini"),
+		}
+		cfg := Config{Projects: []ProjectConfig{p}}
+
+		if err := cfg.validate(); err != nil {
+			t.Fatalf("expected nil error for distinct template types, got %v", err)
+		}
+	})
+
+	t.Run("accepts empty AgentTemplates for backward compat", func(t *testing.T) {
+		p := validProject("demo")
+		cfg := Config{Projects: []ProjectConfig{p}}
+
+		if err := cfg.validate(); err != nil {
+			t.Fatalf("expected nil error for backward-compat empty AgentTemplates, got %v", err)
+		}
+	})
+}

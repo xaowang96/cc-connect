@@ -324,10 +324,26 @@ type RateLimitCfg struct {
 	Window      time.Duration // sliding window size
 }
 
+// AgentConfigTemplate holds the configuration for a switchable agent type
+// within a project. It mirrors config.AgentConfig but lives in core to
+// avoid an import cycle (core must not import config). The Providers
+// field from config.AgentConfig is intentionally omitted because
+// ProviderConfig is a config-package type; provider wiring is handled by
+// cmd/cc-connect/main.go which can import both packages. The ProviderRefs
+// field (plain strings) is safe to include.
+type AgentConfigTemplate struct {
+	Type         string         // agent type name, e.g. "claudecode", "codex", "opencode"
+	Options      map[string]any // constructor options passed to CreateAgent
+	ProviderRefs []string       // references to project-level provider definitions
+}
+
 // Engine routes messages between platforms and the agent for a single project.
 type Engine struct {
 	name                  string
 	agent                 Agent
+	agentTemplates        map[string]AgentConfigTemplate // type → template; populated by SetAgentTemplates
+	defaultAgentType      string                         // captured from agent.Name() at construction
+	agentTemplatesMu      sync.RWMutex                   // guards agentTemplates
 	platforms             []Platform
 	sessions              *SessionManager
 	ctx                   context.Context
@@ -702,6 +718,7 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 	e := &Engine{
 		name:                  name,
 		agent:                 ag,
+		defaultAgentType:      agentNameOrEmpty(ag),
 		platforms:             platforms,
 		sessions:              NewSessionManager(sessionStorePath),
 		ctx:                   ctx,
@@ -741,6 +758,13 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 	return e
 }
 
+func agentNameOrEmpty(ag Agent) string {
+	if ag == nil {
+		return ""
+	}
+	return ag.Name()
+}
+
 // DefaultWorkspaceIdleTimeout is the default time a workspace can be idle
 // before the reaper reclaims it.
 const DefaultWorkspaceIdleTimeout = 15 * time.Minute
@@ -752,7 +776,89 @@ func (e *Engine) SetMultiWorkspace(baseDir, bindingStorePath string) {
 	e.workspaceBindings = NewWorkspaceBindingManager(bindingStorePath)
 	e.workspacePool = newWorkspacePool(DefaultWorkspaceIdleTimeout)
 	e.initFlows = make(map[string]*workspaceInitFlow)
+	e.migrateLegacyWorkspaceSessionFiles()
 	go e.runIdleReaper()
+}
+
+// SetAgentTemplates registers the switchable agent templates for this
+// project. Called from cmd/cc-connect/main.go after NewEngine. The map
+// is keyed by agent type name (e.g. "codex", "opencode"). The project's
+// default agent type (agent.Name()) should NOT be in this map — it is
+// implicitly available.
+func (e *Engine) SetAgentTemplates(templates map[string]AgentConfigTemplate) {
+	e.agentTemplatesMu.Lock()
+	defer e.agentTemplatesMu.Unlock()
+	e.agentTemplates = make(map[string]AgentConfigTemplate, len(templates))
+	for k, v := range templates {
+		e.agentTemplates[k] = v
+	}
+}
+
+// resolveAgentTypeForChannel returns the agent type bound to a channel
+// key, or the project's default agent type if no binding exists or the
+// bound type is not in the templates map.
+func (e *Engine) resolveAgentTypeForChannel(channelKey string) string {
+	if channelKey == "" {
+		return e.defaultAgentType
+	}
+	if e.projectState != nil {
+		if bound := e.projectState.AgentBinding(channelKey); bound != "" {
+			if bound == e.defaultAgentType {
+				return e.defaultAgentType
+			}
+			e.agentTemplatesMu.RLock()
+			_, ok := e.agentTemplates[bound]
+			e.agentTemplatesMu.RUnlock()
+			if ok {
+				return bound
+			}
+		}
+	}
+	return e.defaultAgentType
+}
+
+// migrateLegacyWorkspaceSessionFiles renames old-pattern session files
+// (<project>_ws_<hash>.json) to the new agent-type-aware pattern
+// (<project>_<defaultAgentType>_ws_<hash>.json). This is a no-op until
+// the session filename pattern in getOrCreateWorkspaceAgent is updated
+// to include the agent type (planned for a follow-up commit).
+func (e *Engine) migrateLegacyWorkspaceSessionFiles() {
+	if e.agent == nil {
+		return
+	}
+	storePath := e.sessions.StorePath()
+	if storePath == "" {
+		return
+	}
+	dir := filepath.Dir(storePath)
+	defaultAgentType := e.agent.Name()
+
+	oldPattern := fmt.Sprintf("%s_ws_*.json", e.name)
+	matches, err := filepath.Glob(filepath.Join(dir, oldPattern))
+	if err != nil {
+		slog.Warn("legacy session migration: glob failed", "dir", dir, "pattern", oldPattern, "err", err)
+		return
+	}
+
+	oldRegex := regexp.MustCompile(`^` + regexp.QuoteMeta(e.name) + `_ws_([0-9a-f]+)\.json$`)
+	for _, oldPath := range matches {
+		base := filepath.Base(oldPath)
+		m := oldRegex.FindStringSubmatch(base)
+		if m == nil {
+			continue
+		}
+		newBase := fmt.Sprintf("%s_%s_ws_%s.json", e.name, defaultAgentType, m[1])
+		newPath := filepath.Join(dir, newBase)
+		if _, err := os.Stat(newPath); err == nil {
+			slog.Info("legacy session migration: skipping, target exists", "old", base, "new", newBase)
+			continue
+		}
+		if err := os.Rename(oldPath, newPath); err != nil {
+			slog.Warn("legacy session migration: rename failed", "old", oldPath, "new", newPath, "err", err)
+			continue
+		}
+		slog.Info("legacy session migration: renamed", "old", base, "new", newBase)
+	}
 }
 
 // SetWorkspaceIdleTimeout overrides the workspace idle reaper timeout.
@@ -796,7 +902,7 @@ func (e *Engine) reapIdleWorkspaces() {
 
 	reapedSet := make(map[string]struct{}, len(reaped))
 	for _, ws := range reaped {
-		reapedSet[ws] = struct{}{}
+		reapedSet[ws.workspace] = struct{}{}
 	}
 
 	type cleanupTarget struct {
@@ -817,7 +923,7 @@ func (e *Engine) reapIdleWorkspaces() {
 		e.cleanupInteractiveState(target.key, target.state)
 	}
 	for _, ws := range reaped {
-		slog.Info("workspace idle-reaped", "workspace", ws)
+		slog.Info("workspace idle-reaped", "agent_type", ws.agentType, "workspace", ws.workspace)
 	}
 }
 
@@ -1493,7 +1599,7 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	}
 
 	if job.WorkDir != "" {
-		wsAgent, wsSessions, err := e.getOrCreateWorkspaceAgent(job.WorkDir)
+		wsAgent, wsSessions, err := e.getOrCreateWorkspaceAgent(e.defaultAgentType, job.WorkDir)
 		if err == nil {
 			agent = wsAgent
 			sessions = wsSessions
@@ -1694,7 +1800,7 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
 	}
 
 	if job.WorkDir != "" {
-		wsAgent, wsSessions, err := e.getOrCreateWorkspaceAgent(job.WorkDir)
+		wsAgent, wsSessions, err := e.getOrCreateWorkspaceAgent(e.defaultAgentType, job.WorkDir)
 		if err == nil {
 			agent = wsAgent
 			sessions = wsSessions
@@ -2763,6 +2869,9 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		}
 	}
 
+	// Resolve agent type for this channel (per-channel agent switching, C6/C8)
+	resolvedAgentType := e.resolveAgentTypeForChannel(effectiveWorkspaceChannelKey(msg))
+
 	// Multi-workspace resolution
 	var wsAgent Agent
 	var wsSessions *SessionManager
@@ -2770,7 +2879,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	if forcedWorkDir := e.sendWorkDirForSession(msg.SessionKey); forcedWorkDir != "" {
 		e.bindSendWorkDir(msg.SessionKey, forcedWorkDir)
 		var err error
-		wsAgent, wsSessions, err = e.getOrCreateWorkspaceAgent(forcedWorkDir)
+		wsAgent, wsSessions, err = e.getOrCreateWorkspaceAgent(resolvedAgentType, forcedWorkDir)
 		if err != nil {
 			slog.Error("failed to create send work_dir agent", "work_dir", forcedWorkDir, "err", err)
 			e.reply(p, msg.ReplyCtx, fmt.Sprintf("Failed to initialize workspace: %v", err))
@@ -2805,12 +2914,12 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 			}
 		} else {
 			// Touch for idle tracking
-			if ws := e.workspacePool.Get(workspace); ws != nil {
+			if ws := e.workspacePool.Get(resolvedAgentType, workspace); ws != nil {
 				ws.Touch()
 			}
 
 			var effectiveWorkspace string
-			wsAgent, wsSessions, _, effectiveWorkspace, err = e.workspaceContext(workspace, msg.SessionKey)
+			wsAgent, wsSessions, _, effectiveWorkspace, err = e.workspaceContextForType(resolvedAgentType, workspace, msg.SessionKey)
 			if err != nil {
 				slog.Error("failed to create workspace agent", "workspace", workspace, "err", err)
 				e.reply(p, msg.ReplyCtx, fmt.Sprintf("Failed to initialize workspace: %v", err))
@@ -2828,6 +2937,19 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		sessions = wsSessions
 		agent = wsAgent
 		interactiveKey = resolvedWorkspace + ":" + msg.SessionKey
+	} else if resolvedAgentType != e.defaultAgentType {
+		workDir := e.currentSendWorkDir()
+		altAgent, altSessions, err := e.getOrCreateWorkspaceAgent(resolvedAgentType, workDir)
+		if err != nil {
+			slog.Error("failed to create non-default agent for channel",
+				"agent_type", resolvedAgentType, "err", err)
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf("Failed to initialize agent %s: %v", resolvedAgentType, err))
+			return
+		}
+		agent = altAgent
+		sessions = altSessions
+		resolvedWorkspace = workDir
+		interactiveKey = workDir + ":" + msg.SessionKey
 	}
 
 	if len(msg.Images) == 0 && strings.HasPrefix(content, "/") {
@@ -3601,7 +3723,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	}
 
 	if workspaceDir != "" && e.workspacePool != nil {
-		ws := e.workspacePool.GetOrCreate(workspaceDir)
+		ws := e.workspacePool.GetOrCreate(e.agent.Name(), workspaceDir)
 		ws.BeginTurn()
 		defer ws.EndTurn()
 	}
@@ -3692,9 +3814,16 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	}
 }
 
-// getOrCreateWorkspaceAgent returns (or creates) a per-workspace agent and session manager.
-// workspace must be a normalized path (from resolveWorkspace or normalizeWorkspacePath).
-func (e *Engine) getOrCreateWorkspaceAgent(workspace string) (Agent, *SessionManager, error) {
+// getOrCreateWorkspaceAgent returns (or creates) a per-workspace agent
+// and session manager. workspace must be a normalized path (from
+// resolveWorkspace or normalizeWorkspacePath).
+//
+// agentType selects which registered agent type to create. Passing
+// e.defaultAgentType (or equivalently e.agent.Name()) preserves the
+// pre-C5 behavior of snapshotting the project's default agent. Any other
+// agentType must be registered via SetAgentTemplates, otherwise this
+// function returns an error.
+func (e *Engine) getOrCreateWorkspaceAgent(agentType, workspace string) (Agent, *SessionManager, error) {
 	e.interactiveMu.Lock()
 	if e.workspacePool == nil {
 		e.workspacePool = newWorkspacePool(DefaultWorkspaceIdleTimeout)
@@ -3702,7 +3831,7 @@ func (e *Engine) getOrCreateWorkspaceAgent(workspace string) (Agent, *SessionMan
 	pool := e.workspacePool
 	e.interactiveMu.Unlock()
 
-	ws := pool.GetOrCreate(workspace)
+	ws := pool.GetOrCreate(agentType, workspace)
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 
@@ -3710,11 +3839,27 @@ func (e *Engine) getOrCreateWorkspaceAgent(workspace string) (Agent, *SessionMan
 		return ws.agent, ws.sessions, nil
 	}
 
-	// Create a new agent instance with this workspace's work_dir
+	// Build the base opts map. For the project's default agent type we
+	// mirror the pre-C5 path: snapshot the live default agent's
+	// workspace options so runtime state (tmux session name, current
+	// model/mode, etc.) is preserved. For non-default types there is no
+	// live agent to snapshot — the template's Options map is the source
+	// of truth.
 	opts := make(map[string]any)
-	// Let the agent seed its own base options (e.g. tmux session name)
-	if snapshotter, ok := e.agent.(WorkspaceAgentOptionSnapshotter); ok {
-		for k, v := range snapshotter.WorkspaceAgentOptions() {
+	if agentType == e.defaultAgentType {
+		if snapshotter, ok := e.agent.(WorkspaceAgentOptionSnapshotter); ok {
+			for k, v := range snapshotter.WorkspaceAgentOptions() {
+				opts[k] = v
+			}
+		}
+	} else {
+		e.agentTemplatesMu.RLock()
+		tmpl, ok := e.agentTemplates[agentType]
+		e.agentTemplatesMu.RUnlock()
+		if !ok {
+			return nil, nil, fmt.Errorf("agent type %q is not a registered template and not the default", agentType)
+		}
+		for k, v := range tmpl.Options {
 			opts[k] = v
 		}
 	}
@@ -3728,16 +3873,19 @@ func (e *Engine) getOrCreateWorkspaceAgent(workspace string) (Agent, *SessionMan
 		}
 	}
 
-	// Copy model from original agent if possible
-	if _, ok := opts["model"]; !ok {
+	// Copy model from original agent if possible. Only do this for the
+	// default type — for non-default types the template's Options is
+	// the source of truth, and copying e.agent's model would leak the
+	// default agent's model into the new agent.
+	if _, ok := opts["model"]; !ok && agentType == e.defaultAgentType {
 		if ma, ok := e.agent.(interface{ GetModel() string }); ok {
 			if m := ma.GetModel(); m != "" {
 				opts["model"] = m
 			}
 		}
 	}
-	// Copy permission mode
-	if _, ok := opts["mode"]; !ok {
+	// Copy permission mode (same default-type-only reasoning as model)
+	if _, ok := opts["mode"]; !ok && agentType == e.defaultAgentType {
 		if ma, ok := e.agent.(interface{ GetMode() string }); ok {
 			if m := ma.GetMode(); m != "" {
 				opts["mode"] = m
@@ -3750,6 +3898,9 @@ func (e *Engine) getOrCreateWorkspaceAgent(workspace string) (Agent, *SessionMan
 	// above, not inherited from the project-level opts that main.go
 	// already decorated. See cc-connect#496 and the cc-connect/core/runas.go
 	// preamble for why run_as_user has to survive this copy.
+	// run_as_user/run_as_env are project-level isolation settings that
+	// apply to every agent type, so they are copied for both the
+	// default and non-default types.
 	if _, ok := opts["run_as_user"]; !ok {
 		if u := e.runAsUser(); u != "" {
 			opts["run_as_user"] = u
@@ -3763,12 +3914,20 @@ func (e *Engine) getOrCreateWorkspaceAgent(workspace string) (Agent, *SessionMan
 		}
 	}
 
-	agent, err := CreateAgent(e.agent.Name(), opts)
+	agent, err := CreateAgent(agentType, opts)
 	if err != nil {
 		return nil, nil, fmt.Errorf("create workspace agent for %s: %w", workspace, err)
 	}
 
-	// Wire providers if original agent has them
+	// Wire providers if original agent has them.
+	//
+	// Known limitation (Phase 1): for non-default agent types this
+	// copies the default agent's providers onto the new agent. The
+	// template's own ProviderRefs are not yet wired here — resolving
+	// provider names to ProviderConfig objects is a config-layer
+	// concern and is deferred to a follow-up commit. Having the
+	// default agent's providers is strictly better than having none,
+	// because many agents refuse to start without a provider set.
 	if ps, ok := e.agent.(ProviderSwitcher); ok {
 		if ps2, ok2 := agent.(ProviderSwitcher); ok2 {
 			ps2.SetProviders(ps.ListProviders())
@@ -3778,10 +3937,13 @@ func (e *Engine) getOrCreateWorkspaceAgent(workspace string) (Agent, *SessionMan
 		}
 	}
 
-	// Create per-workspace session manager
+	// Create per-workspace session manager. The filename includes the
+	// agent type so that sessions for different agent types in the same
+	// workspace do not collide (e.g. myproject_claudecode_ws_abcd.json
+	// vs myproject_codex_ws_abcd.json).
 	h := sha256.Sum256([]byte(workspace))
 	sessionFile := filepath.Join(filepath.Dir(e.sessions.StorePath()),
-		fmt.Sprintf("%s_ws_%s.json", e.name, hex.EncodeToString(h[:4])))
+		fmt.Sprintf("%s_%s_ws_%s.json", e.name, agentType, hex.EncodeToString(h[:4])))
 	sessions := NewSessionManager(sessionFile)
 
 	ws.agent = agent
@@ -3808,7 +3970,19 @@ func (e *Engine) resolveChannelWorkDir(workspace, interactiveKey string) string 
 func (e *Engine) workspaceContext(workspace, sessionKey string) (Agent, *SessionManager, string, string, error) {
 	interactiveKey := workspace + ":" + sessionKey
 	effectiveDir := e.resolveChannelWorkDir(workspace, interactiveKey)
-	wsAgent, wsSessions, err := e.getOrCreateWorkspaceAgent(effectiveDir)
+	wsAgent, wsSessions, err := e.getOrCreateWorkspaceAgent(e.defaultAgentType, effectiveDir)
+	if err != nil {
+		return nil, nil, "", "", err
+	}
+	return wsAgent, wsSessions, interactiveKey, effectiveDir, nil
+}
+
+// workspaceContextForType is workspaceContext with an explicit agentType,
+// used by callers that resolve the agent type per-channel (C6 routing).
+func (e *Engine) workspaceContextForType(agentType, workspace, sessionKey string) (Agent, *SessionManager, string, string, error) {
+	interactiveKey := workspace + ":" + sessionKey
+	effectiveDir := e.resolveChannelWorkDir(workspace, interactiveKey)
+	wsAgent, wsSessions, err := e.getOrCreateWorkspaceAgent(agentType, effectiveDir)
 	if err != nil {
 		return nil, nil, "", "", err
 	}
@@ -4271,7 +4445,7 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 	defer func() {
 		if turnActive {
 			if workspaceDir != "" && e.workspacePool != nil {
-				if ws := e.workspacePool.Get(workspaceDir); ws != nil {
+				if ws := e.workspacePool.Get(e.agent.Name(), workspaceDir); ws != nil {
 					ws.EndTurn()
 				}
 			}
@@ -4328,7 +4502,7 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 			if !turnActive {
 				turnActive = true
 				if workspaceDir != "" && e.workspacePool != nil {
-					if ws := e.workspacePool.Get(workspaceDir); ws != nil {
+					if ws := e.workspacePool.Get(e.agent.Name(), workspaceDir); ws != nil {
 						ws.BeginTurn()
 					}
 				}
@@ -4391,7 +4565,7 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				toolsUsed = nil
 				turnActive = false
 				if workspaceDir != "" && e.workspacePool != nil {
-					if ws := e.workspacePool.Get(workspaceDir); ws != nil {
+					if ws := e.workspacePool.Get(e.agent.Name(), workspaceDir); ws != nil {
 						ws.EndTurn()
 					}
 				}
@@ -4536,7 +4710,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		}
 	}
 	sp := newStreamPreview(e.streamPreview, state.platform, state.replyCtx, e.ctx, workspaceRenderer)
-	cp := newCompactProgressWriter(e.ctx, state.platform, state.replyCtx, e.agent.Name(), e.i18n.CurrentLang(), workspaceRenderer)
+	cp := newCompactProgressWriter(e.ctx, state.platform, state.replyCtx, replyAgent.Name(), e.i18n.CurrentLang(), workspaceRenderer)
 	state.mu.Unlock()
 
 	// Send instant confirmation reply if enabled and no streaming card is active.
@@ -5098,10 +5272,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					}
 				}
 			}
-			if event.SessionID != "" {
-				wasEmpty := session.GetAgentSessionID() == ""
-				if session.GetAgentSessionID() != event.SessionID {
-					session.SetAgentSessionID(event.SessionID, e.agent.Name())
+		if event.SessionID != "" {
+			wasEmpty := session.GetAgentSessionID() == ""
+			if session.GetAgentSessionID() != event.SessionID {
+				session.SetAgentSessionID(event.SessionID, replyAgent.Name())
 					if wasEmpty {
 						pendingName := session.GetName()
 						if pendingName != "" && pendingName != "session" && pendingName != "default" {
@@ -5212,10 +5386,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			// event.SessionID may be empty in some cases, causing the agent_session_id
 			// to not be persisted to disk, breaking session resume on next startup.
 			if state != nil && state.agentSession != nil {
-				if currentID := state.agentSession.CurrentSessionID(); currentID != "" {
-					wasEmpty := session.GetAgentSessionID() == ""
-					if session.GetAgentSessionID() != currentID {
-						session.SetAgentSessionID(currentID, e.agent.Name())
+			if currentID := state.agentSession.CurrentSessionID(); currentID != "" {
+				wasEmpty := session.GetAgentSessionID() == ""
+				if session.GetAgentSessionID() != currentID {
+					session.SetAgentSessionID(currentID, replyAgent.Name())
 						if wasEmpty {
 							pendingName := session.GetName()
 							if pendingName != "" && pendingName != "session" && pendingName != "default" {
@@ -5631,8 +5805,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				queuedRenderer := func(content string) string {
 					return e.renderOutgoingContentForWorkspace(queued.platform, content, workspaceDir)
 				}
-				sp = newStreamPreview(e.streamPreview, queued.platform, queued.replyCtx, e.ctx, queuedRenderer)
-				cp = newCompactProgressWriter(e.ctx, queued.platform, queued.replyCtx, e.agent.Name(), e.i18n.CurrentLang(), queuedRenderer)
+			sp = newStreamPreview(e.streamPreview, queued.platform, queued.replyCtx, e.ctx, queuedRenderer)
+			cp = newCompactProgressWriter(e.ctx, queued.platform, queued.replyCtx, replyAgent.Name(), e.i18n.CurrentLang(), queuedRenderer)
 
 				// Reset streaming card state for the next turn
 				streamCard = nil
@@ -5955,6 +6129,7 @@ var builtinCommands = []struct {
 	{[]string{"lang"}, "lang"},
 	{[]string{"quiet"}, "quiet"},
 	{[]string{"provider"}, "provider"},
+	{[]string{"agent"}, "agent"},
 	{[]string{"memory"}, "memory"},
 	{[]string{"cron"}, "cron"},
 	{[]string{"timer", "at", "remind"}, "timer"},
@@ -6169,6 +6344,8 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		e.cmdQuiet(p, msg, args)
 	case "provider":
 		e.cmdProvider(p, msg, args)
+	case "agent":
+		e.cmdAgent(p, msg, args)
 	case "memory":
 		e.cmdMemory(p, msg, args)
 	case "cron":
@@ -8896,7 +9073,7 @@ func (e *Engine) cmdHelp(p Platform, msg *Message) {
 func (e *Engine) cmdStart(p Platform, msg *Message) {
 	name := e.name
 	if name == "" {
-		name = e.agent.Name()
+		name = e.resolveAgentTypeForChannel(effectiveWorkspaceChannelKey(msg))
 	}
 	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgWelcome), name))
 }
@@ -9275,7 +9452,8 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 		target = resolveModelSwitchTarget(target, models)
 	}
 
-	target, err = e.switchModelOnAgent(agent, target, agent == e.agent)
+	agentType := e.resolveAgentTypeForChannel(effectiveWorkspaceChannelKey(msg))
+	target, err = e.switchModelOnAgent(agent, target, agent == e.agent && agentType == e.defaultAgentType)
 	if err != nil {
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgModelChangeFailed, err))
 		return
@@ -10195,7 +10373,8 @@ func (e *Engine) cmdProvider(p Platform, msg *Message, args []string) {
 		}
 		// Only persist to global config when operating on the global agent;
 		// in workspace mode the provider state lives on the per-workspace agent.
-		if sessions == e.sessions && e.providerSaveFunc != nil {
+		agentType := e.resolveAgentTypeForChannel(effectiveWorkspaceChannelKey(msg))
+		if sessions == e.sessions && agentType == e.defaultAgentType && e.providerSaveFunc != nil {
 			if err := e.providerSaveFunc(""); err != nil {
 				slog.Error("failed to save provider", "error", err)
 			}
@@ -10214,7 +10393,7 @@ func (e *Engine) cmdProviderAdd(p Platform, msg *Message, switcher ProviderSwitc
 			return
 		}
 		if _, ok := p.(InlineButtonSender); ok {
-			if btns := e.providerAddPresetButtons(); len(btns) > 0 {
+			if btns := e.providerAddPresetButtons(msg); len(btns) > 0 {
 				e.replyWithButtons(p, msg.ReplyCtx,
 					e.i18n.T(MsgProviderAddPickHint), btns)
 				return
@@ -10366,13 +10545,187 @@ func (e *Engine) switchProvider(p Platform, msg *Message, sessions *SessionManag
 
 	// Only persist to global config when operating on the global agent;
 	// in workspace mode the provider state lives on the per-workspace agent.
-	if sessions == e.sessions && e.providerSaveFunc != nil {
+	agentType := e.resolveAgentTypeForChannel(effectiveWorkspaceChannelKey(msg))
+	if sessions == e.sessions && agentType == e.defaultAgentType && e.providerSaveFunc != nil {
 		if err := e.providerSaveFunc(name); err != nil {
 			slog.Error("failed to save provider", "error", err)
 		}
 	}
 
 	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgProviderSwitched), name))
+}
+
+// ──────────────────────────────────────────────────────────────
+// /agent command (C8)
+// ──────────────────────────────────────────────────────────────
+
+// cmdAgent implements the /agent builtin command. Subcommands: list, current,
+// switch. switch is admin-gated; list and current are open to all users.
+// The command is disabled (MsgAgentNotMultiAgent) when no agent_templates
+// are configured for the project.
+func (e *Engine) cmdAgent(p Platform, msg *Message, args []string) {
+	if len(e.agentTemplates) == 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgAgentNotMultiAgent))
+		return
+	}
+	if len(args) == 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgAgentUsage))
+		return
+	}
+	sub := matchSubCommand(strings.ToLower(args[0]), []string{"list", "current", "switch"})
+	channelKey := effectiveWorkspaceChannelKey(msg)
+	switch sub {
+	case "list":
+		e.replyAgentList(p, msg, channelKey)
+	case "current":
+		cur := e.resolveAgentTypeForChannel(channelKey)
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgAgentCurrent, cur))
+	case "switch":
+		e.handleAgentSwitch(p, msg, args, channelKey)
+	default:
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgAgentUsage))
+	}
+}
+
+func (e *Engine) replyAgentList(p Platform, msg *Message, channelKey string) {
+	cur := e.resolveAgentTypeForChannel(channelKey)
+	var sb strings.Builder
+	sb.WriteString(e.i18n.T(MsgAgentListHeader))
+	sb.WriteString("\n")
+	marker := "  "
+	if cur == e.defaultAgentType {
+		marker = "▶ "
+	}
+	sb.WriteString(fmt.Sprintf("%s%s\n", marker, e.defaultAgentType))
+	e.agentTemplatesMu.RLock()
+	types := make([]string, 0, len(e.agentTemplates))
+	for typ := range e.agentTemplates {
+		types = append(types, typ)
+	}
+	e.agentTemplatesMu.RUnlock()
+	sort.Strings(types)
+	for _, typ := range types {
+		marker := "  "
+		if typ == cur {
+			marker = "▶ "
+		}
+		sb.WriteString(fmt.Sprintf("%s%s\n", marker, typ))
+	}
+	e.reply(p, msg.ReplyCtx, sb.String())
+}
+
+// handleAgentSwitch validates the target, stops the old agent session,
+// persists the binding, and replies. Only switch requires admin (decision #5).
+func (e *Engine) handleAgentSwitch(p Platform, msg *Message, args []string, channelKey string) {
+	if !e.isAdmin(msg.UserID) {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgAdminRequired), "/agent switch"))
+		return
+	}
+	if len(args) < 2 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgAgentUsage))
+		return
+	}
+	target := strings.ToLower(strings.TrimSpace(args[1]))
+	if target == "" {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgAgentUsage))
+		return
+	}
+
+	if target != e.defaultAgentType {
+		e.agentTemplatesMu.RLock()
+		_, ok := e.agentTemplates[target]
+		e.agentTemplatesMu.RUnlock()
+		if !ok {
+			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgAgentSwitchUnknown, target))
+			return
+		}
+	}
+
+	cur := e.resolveAgentTypeForChannel(channelKey)
+	if cur == target {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgAgentSwitchSameType, target))
+		return
+	}
+
+	// Stop the old agent session BEFORE persisting the binding so the old
+	// agent process cannot consume a message that should route to the new type.
+	e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgAgentSwitchInFlight, cur, target))
+	e.stopChannelAgentSession(channelKey, cur)
+
+	if e.projectState != nil {
+		if target == e.defaultAgentType {
+			e.projectState.ClearAgentBinding(channelKey)
+		} else {
+			e.projectState.SetAgentBinding(channelKey, target)
+		}
+		e.projectState.Save()
+	}
+
+	slog.Info("agent_switched",
+		"project", e.name, "channel", channelKey,
+		"from", cur, "to", target, "user", msg.UserID)
+
+	e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgAgentSwitchOK, target))
+}
+
+// stopChannelAgentSession stops every active interactive agent session for
+// the given channel. Interactive state keys are either a raw sessionKey
+// ("<platform>:<channelID>[:<userID>]") or, in multi-workspace mode, a
+// composite "<workspace>:<sessionKey>". We scan the live interactiveStates
+// map and match by channel key.
+func (e *Engine) stopChannelAgentSession(channelKey, oldAgentType string) {
+	if channelKey == "" {
+		return
+	}
+	e.interactiveMu.Lock()
+	var toStop []string
+	for k := range e.interactiveStates {
+		if interactiveKeyBelongsToChannel(k, channelKey) {
+			toStop = append(toStop, k)
+		}
+	}
+	e.interactiveMu.Unlock()
+
+	for _, k := range toStop {
+		e.cleanupInteractiveState(k)
+	}
+	if len(toStop) > 0 {
+		slog.Info("agent_switch: stopped channel sessions",
+			"channel", channelKey, "old_agent_type", oldAgentType,
+			"stopped_count", len(toStop))
+	}
+}
+
+// interactiveKeyBelongsToChannel reports whether an interactive state key
+// belongs to the given channel ("<platform>:<channelID>"). Handles both
+// single-workspace (raw sessionKey) and multi-workspace
+// ("<workspace>:<sessionKey>") key formats.
+func interactiveKeyBelongsToChannel(interactiveKey, channelKey string) bool {
+	if interactiveKey == "" || channelKey == "" {
+		return false
+	}
+	if extractWorkspaceChannelKey(interactiveKey) == channelKey {
+		return true
+	}
+	target := channelKey + ":"
+	for start := 0; start < len(interactiveKey); {
+		idx := strings.Index(interactiveKey[start:], target)
+		if idx < 0 {
+			break
+		}
+		absIdx := start + idx
+		if absIdx == 0 || interactiveKey[absIdx-1] == ':' {
+			return true
+		}
+		start = absIdx + 1
+	}
+	if strings.HasSuffix(interactiveKey, channelKey) {
+		prefix := interactiveKey[:len(interactiveKey)-len(channelKey)]
+		if prefix == "" || strings.HasSuffix(prefix, ":") {
+			return true
+		}
+	}
+	return false
 }
 
 // handlePendingProviderAdd checks for a pending provider add state (from the
@@ -10492,8 +10845,8 @@ func (e *Engine) getPendingProviderAdd(sessionKey string) *pendingProviderAddSta
 
 // providerAddPresetButtons builds inline keyboard rows for platforms
 // that support InlineButtonSender but not full cards.
-func (e *Engine) providerAddPresetButtons() [][]ButtonOption {
-	agentType := e.agent.Name()
+func (e *Engine) providerAddPresetButtons(msg *Message) [][]ButtonOption {
+	agentType := e.resolveAgentTypeForChannel(effectiveWorkspaceChannelKey(msg))
 	presets, err := FetchProviderPresets()
 	if err != nil || presets == nil || len(presets.Providers) == 0 {
 		return nil
@@ -10522,7 +10875,7 @@ func (e *Engine) providerAddPresetButtons() [][]ButtonOption {
 // tryProviderAddPreset handles "/provider add <name>" with a single arg that
 // matches a preset name — sets up the pending API key flow.
 func (e *Engine) tryProviderAddPreset(p Platform, msg *Message, switcher ProviderSwitcher, presetName string) bool {
-	agentType := e.agent.Name()
+	agentType := e.resolveAgentTypeForChannel(effectiveWorkspaceChannelKey(msg))
 	presets, err := FetchProviderPresets()
 	if err != nil || presets == nil {
 		return false
@@ -10691,7 +11044,7 @@ func (e *Engine) SendToSessionInWorkDir(sessionKey, message string, images []Ima
 		return fmt.Errorf("no active session found (key=%q)", sessionKey)
 	}
 
-	_, sessions, err := e.getOrCreateWorkspaceAgent(workDir)
+	_, sessions, err := e.getOrCreateWorkspaceAgent(e.defaultAgentType, workDir)
 	if err != nil {
 		return err
 	}
@@ -11615,7 +11968,7 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 	case "/config":
 		return e.renderConfigCard()
 	case "/skills":
-		return e.renderSkillsCard()
+		return e.renderSkillsCard(e.resolveAgentTypeForChannel(extractWorkspaceChannelKey(sessionKey)))
 	case "/doctor":
 		return e.renderDoctorCard()
 	case "/whoami":
@@ -11662,7 +12015,8 @@ func (e *Engine) handleModelCardAction(args, sessionKey string) *Card {
 		cancel()
 	}
 
-	resolved, err := e.switchModelOnAgent(agent, target, agent == e.agent)
+	agentType := e.resolveAgentTypeForChannel(extractWorkspaceChannelKey(sessionKey))
+	resolved, err := e.switchModelOnAgent(agent, target, agent == e.agent && agentType == e.defaultAgentType)
 	interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
 	if err == nil {
 		e.persistWorkspaceModelOverride(interactiveKey, sessionKey, agent, resolved)
@@ -11679,7 +12033,7 @@ func (e *Engine) persistWorkspaceModelOverride(interactiveKey, sessionKey string
 	if e.projectState == nil || !e.multiWorkspace || model == "" {
 		return
 	}
-	if agent == e.agent {
+	if agent == e.agent && e.resolveAgentTypeForChannel(extractWorkspaceChannelKey(sessionKey)) == e.defaultAgentType {
 		return
 	}
 	workspace := workspaceModelOverrideKey(interactiveKey, sessionKey, agent)
@@ -12274,7 +12628,8 @@ func (e *Engine) pushDeleteModeResultCard(sessionKey string) {
 }
 
 func (e *Engine) performModelSwitchAsync(sessionKey string, state *interactiveState, agent Agent, sessions *SessionManager, target string) {
-	resolved, err := e.switchModelOnAgent(agent, target, agent == e.agent)
+	agentType := e.resolveAgentTypeForChannel(extractWorkspaceChannelKey(sessionKey))
+	resolved, err := e.switchModelOnAgent(agent, target, agent == e.agent && agentType == e.defaultAgentType)
 	if err == nil {
 		interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
 		e.persistWorkspaceModelOverride(interactiveKey, sessionKey, agent, resolved)
@@ -12976,7 +13331,7 @@ func (e *Engine) renderProviderAddCard(sessionKey string) *Card {
 	}
 
 	// Show preset selection card
-	agentType := e.agent.Name()
+	agentType := e.resolveAgentTypeForChannel(extractWorkspaceChannelKey(sessionKey))
 	lang := e.i18n.CurrentLang()
 
 	cb := NewCard().Title(e.i18n.T(MsgCardTitleProviderAdd), "indigo").
@@ -13302,14 +13657,14 @@ func (e *Engine) renderConfigCard() *Card {
 		Build()
 }
 
-func (e *Engine) renderSkillsCard() *Card {
+func (e *Engine) renderSkillsCard(agentType string) *Card {
 	skills := e.skills.ListAll()
 	if len(skills) == 0 {
 		return e.simpleCard(e.i18n.T(MsgCardTitleSkills), "purple", e.i18n.T(MsgSkillsEmpty))
 	}
 
 	var sb strings.Builder
-	sb.WriteString(e.i18n.Tf(MsgSkillsTitle, e.agent.Name(), len(skills)))
+	sb.WriteString(e.i18n.Tf(MsgSkillsTitle, agentType, len(skills)))
 	for _, s := range skills {
 		sb.WriteString(fmt.Sprintf("  /%s — %s\n", s.Name, s.Description))
 	}
@@ -14426,8 +14781,9 @@ func (e *Engine) cmdSkills(p Platform, msg *Message) {
 			return
 		}
 
+		agentType := e.resolveAgentTypeForChannel(effectiveWorkspaceChannelKey(msg))
 		var sb strings.Builder
-		sb.WriteString(e.i18n.Tf(MsgSkillsTitle, e.agent.Name(), len(skills)))
+		sb.WriteString(e.i18n.Tf(MsgSkillsTitle, agentType, len(skills)))
 
 		for _, s := range skills {
 			sb.WriteString(fmt.Sprintf("  /%s — %s\n", displayCommandForPlatform(p.Name(), s.Name), s.Description))
@@ -14441,7 +14797,7 @@ func (e *Engine) cmdSkills(p Platform, msg *Message) {
 		return
 	}
 
-	e.replyWithCard(p, msg.ReplyCtx, e.renderSkillsCard())
+	e.replyWithCard(p, msg.ReplyCtx, e.renderSkillsCard(e.resolveAgentTypeForChannel(effectiveWorkspaceChannelKey(msg))))
 }
 
 func displayCommandForPlatform(platformName, command string) string {
@@ -15356,11 +15712,11 @@ func (e *Engine) relayContextForSourceSessionKey(fromProject, sourceSessionKey s
 		return nil, nil, "", fmt.Errorf("no workspace binding for source channel %q", channelKey)
 	}
 
-	agent, sessions, err := e.getOrCreateWorkspaceAgent(workspace)
+	agent, sessions, err := e.getOrCreateWorkspaceAgent(e.defaultAgentType, workspace)
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("get relay workspace agent: %w", err)
 	}
-	if ws := e.workspacePool.Get(workspace); ws != nil {
+	if ws := e.workspacePool.Get(e.agent.Name(), workspace); ws != nil {
 		ws.Touch()
 	}
 	return agent, sessions, relaySessionKey, nil
@@ -15877,13 +16233,33 @@ func (e *Engine) commandContext(p Platform, msg *Message) (Agent, *SessionManage
 // commandContextWithWorkspace is like commandContext but additionally returns
 // the resolved workspace path for callers that need to forward it to
 // processInteractiveMessageWith (idle reaper bookkeeping, reply footer, etc).
+//
+// The agent type is resolved per-channel via resolveAgentTypeForChannel so
+// that channels bound to a non-default agent type route to that agent even
+// in single-workspace mode.
 func (e *Engine) commandContextWithWorkspace(p Platform, msg *Message) (Agent, *SessionManager, string, string, error) {
+	channelKey := effectiveWorkspaceChannelKey(msg)
+	agentType := e.resolveAgentTypeForChannel(channelKey)
+
 	if !e.multiWorkspace {
+		// Default-type fast path: identical to pre-C6 behavior. Only
+		// deviate when a non-default agent type is bound to this channel.
+		if agentType == e.defaultAgentType {
+			return e.agent, e.sessions, msg.SessionKey, "", nil
+		}
+		if wsAgent, wsSessions, _, effectiveDir, err := e.workspaceContextForType(agentType, e.currentSendWorkDir(), msg.SessionKey); err == nil {
+			return wsAgent, wsSessions, msg.SessionKey, effectiveDir, nil
+		}
 		return e.agent, e.sessions, msg.SessionKey, "", nil
 	}
 	channelID := effectiveChannelID(msg)
-	channelKey := effectiveWorkspaceChannelKey(msg)
 	if channelKey == "" || channelID == "" {
+		if agentType == e.defaultAgentType {
+			return e.agent, e.sessions, msg.SessionKey, "", nil
+		}
+		if wsAgent, wsSessions, _, effectiveDir, err := e.workspaceContextForType(agentType, e.currentSendWorkDir(), msg.SessionKey); err == nil {
+			return wsAgent, wsSessions, msg.SessionKey, effectiveDir, nil
+		}
 		return e.agent, e.sessions, msg.SessionKey, "", nil
 	}
 	workspace, _, err := e.resolveWorkspace(p, channelID)
@@ -15891,9 +16267,15 @@ func (e *Engine) commandContextWithWorkspace(p Platform, msg *Message) (Agent, *
 		return nil, nil, "", "", err
 	}
 	if workspace == "" {
+		if agentType == e.defaultAgentType {
+			return e.agent, e.sessions, msg.SessionKey, "", nil
+		}
+		if wsAgent, wsSessions, _, effectiveDir, err := e.workspaceContextForType(agentType, e.currentSendWorkDir(), msg.SessionKey); err == nil {
+			return wsAgent, wsSessions, msg.SessionKey, effectiveDir, nil
+		}
 		return e.agent, e.sessions, msg.SessionKey, "", nil
 	}
-	agent, sessions, interactiveKey, effectiveDir, err := e.workspaceContext(workspace, msg.SessionKey)
+	agent, sessions, interactiveKey, effectiveDir, err := e.workspaceContextForType(agentType, workspace, msg.SessionKey)
 	if err != nil {
 		return nil, nil, "", "", err
 	}
@@ -15902,18 +16284,36 @@ func (e *Engine) commandContextWithWorkspace(p Platform, msg *Message) (Agent, *
 
 // sessionContextForKey resolves the agent and session manager for a sessionKey.
 // It uses existing workspace bindings and falls back to global context if unresolved.
+//
+// The agent type is resolved per-channel via resolveAgentTypeForChannel: if a
+// channel has an agent-type binding (projectState.AgentBinding) and a template
+// exists for that type, the bound type is used. Otherwise the project's
+// default agent type is used and behavior is identical to pre-C6.
 func (e *Engine) sessionContextForKey(sessionKey string) (Agent, *SessionManager) {
+	channelKey := extractWorkspaceChannelKey(sessionKey)
+	agentType := e.resolveAgentTypeForChannel(channelKey)
+
 	if workspace := e.sendWorkDirForSession(sessionKey); workspace != "" {
-		if wsAgent, wsSessions, err := e.getOrCreateWorkspaceAgent(workspace); err == nil {
+		if wsAgent, wsSessions, err := e.getOrCreateWorkspaceAgent(agentType, workspace); err == nil {
 			return wsAgent, wsSessions
 		}
 	}
 	if !e.multiWorkspace || e.workspaceBindings == nil {
+		// Single-workspace mode: keep the default-type fast path (returning
+		// the project agent directly) when no per-channel binding overrides
+		// the agent type. Only when a non-default type is bound do we
+		// materialize a workspace-scoped agent using the project's work_dir.
+		if agentType == e.defaultAgentType {
+			return e.agent, e.sessions
+		}
+		if wsAgent, wsSessions, err := e.getOrCreateWorkspaceAgent(agentType, e.currentSendWorkDir()); err == nil {
+			return wsAgent, wsSessions
+		}
 		return e.agent, e.sessions
 	}
-	if channelKey := extractWorkspaceChannelKey(sessionKey); channelKey != "" {
+	if channelKey != "" {
 		if b, _, usable := e.lookupEffectiveWorkspaceBinding(channelKey); usable {
-			if wsAgent, wsSessions, err := e.getOrCreateWorkspaceAgent(normalizeWorkspacePath(b.Workspace)); err == nil {
+			if wsAgent, wsSessions, err := e.getOrCreateWorkspaceAgent(agentType, normalizeWorkspacePath(b.Workspace)); err == nil {
 				return wsAgent, wsSessions
 			}
 		}
@@ -15926,7 +16326,14 @@ func (e *Engine) sessionContextForKey(sessionKey string) (Agent, *SessionManager
 	// returns the workspace-prefixed key, allowing concurrent unlocked sends
 	// to the same agent session.
 	if workspace := e.workspaceFromLiveState(sessionKey); workspace != "" {
-		if wsAgent, wsSessions, err := e.getOrCreateWorkspaceAgent(workspace); err == nil {
+		if wsAgent, wsSessions, err := e.getOrCreateWorkspaceAgent(agentType, workspace); err == nil {
+			return wsAgent, wsSessions
+		}
+	}
+	// Global fallback: same reasoning as the single-workspace branch —
+	// only deviate from e.agent when a non-default type is bound.
+	if agentType != e.defaultAgentType {
+		if wsAgent, wsSessions, err := e.getOrCreateWorkspaceAgent(agentType, e.currentSendWorkDir()); err == nil {
 			return wsAgent, wsSessions
 		}
 	}
